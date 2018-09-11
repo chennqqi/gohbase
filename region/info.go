@@ -14,8 +14,8 @@ import (
 	"sync"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/pb"
+	"github.com/chennqqi/gohbase/hrpc"
+	"github.com/chennqqi/gohbase/pb"
 )
 
 var defaultNamespace = []byte("default")

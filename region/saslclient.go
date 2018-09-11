@@ -17,6 +17,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/beltran/gosasl"
 	"github.com/golang/protobuf/proto"
 	"github.com/chennqqi/gohbase/hrpc"
 	"github.com/chennqqi/gohbase/pb"
@@ -122,7 +123,10 @@ func (e RetryableError) Error() string {
 }
 
 // client manages a connection to a RegionServer.
-type client struct {
+type saslclient struct {
+	// sasl client
+	saslClient *gosasl.Client
+
 	conn net.Conn
 
 	// Address of the RegionServer.
@@ -154,8 +158,67 @@ type client struct {
 	readTimeout time.Duration
 }
 
+// NewClient creates a new RegionClient.
+func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
+	queueSize int, flushInterval time.Duration, effectiveUser string,
+	readTimeout time.Duration) (hrpc.RegionClient, error) {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to the RegionServer at %s: %s", addr, err)
+	}
+	c := &client{
+		addr:          addr,
+		conn:          conn,
+		rpcs:          make(chan hrpc.Call),
+		done:          make(chan struct{}),
+		sent:          make(map[uint32]hrpc.Call),
+		rpcQueueSize:  queueSize,
+		flushInterval: flushInterval,
+		effectiveUser: effectiveUser,
+		readTimeout:   readTimeout,
+	}
+	//step 0. init
+	var mechanismName string
+	var configuration map[sring]string
+
+	//step 1. sasl init
+	var mechanism gosasl.Mechanism
+	if mechanismName == "PLAIN" {
+		mechanism = gosasl.NewPlainMechanism(configuration["username"], configuration["password"])
+	} else if mechanismName == "GSSAPI" {
+		var err error
+		mechanism, err = gosasl.NewGSSAPIMechanism(configuration["service"])
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		panic("Mechanism not supported")
+	}
+	sasl_client := gosasl.NewSaslClient(host, mechanism)
+	c
+
+	// time out send hello if it take long
+	// TODO: do we even need to bother, we are going to retry anyway?
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetWriteDeadline(deadline)
+	}
+	if err := c.sendHello(ctype); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to send hello to the RegionServer at %s: %s", addr, err)
+	}
+	// reset write deadline
+	conn.SetWriteDeadline(time.Time{})
+
+	if ctype == RegionClient {
+		go c.processRPCs() // Batching goroutine
+	}
+	go c.receiveRPCs() // Reader goroutine
+	return c, nil
+}
+
 // QueueRPC will add an rpc call to the queue for processing by the writer goroutine
-func (c *client) QueueRPC(rpc hrpc.Call) {
+func (c *saslclient) QueueRPC(rpc hrpc.Call) {
 	if b, ok := rpc.(hrpc.Batchable); ok && c.rpcQueueSize > 1 && !b.SkipBatch() {
 		// queue up the rpc
 		select {
@@ -175,21 +238,21 @@ func (c *client) QueueRPC(rpc hrpc.Call) {
 // Close asks this region.Client to close its connection to the RegionServer.
 // All queued and outstanding RPCs, if any, will be failed as if a connection
 // error had happened.
-func (c *client) Close() {
+func (c *saslclient) Close() {
 	c.fail(ErrClientDead)
 }
 
 // Addr returns address of the region server the client is connected to
-func (c *client) Addr() string {
+func (c *saslclient) Addr() string {
 	return c.addr
 }
 
 // String returns a string represintation of the current region client
-func (c *client) String() string {
+func (c *saslclient) String() string {
 	return fmt.Sprintf("RegionClient{Addr: %s}", c.addr)
 }
 
-func (c *client) inFlightUp() {
+func (c *saslclient) inFlightUp() {
 	c.inFlightM.Lock()
 	c.inFlight++
 	// we expect that at least the last request can be completed within readTimeout
@@ -197,7 +260,7 @@ func (c *client) inFlightUp() {
 	c.inFlightM.Unlock()
 }
 
-func (c *client) inFlightDown() {
+func (c *saslclient) inFlightDown() {
 	c.inFlightM.Lock()
 	c.inFlight--
 	// reset read timeout if we are not waiting for any responses
@@ -208,7 +271,7 @@ func (c *client) inFlightDown() {
 	c.inFlightM.Unlock()
 }
 
-func (c *client) fail(err error) {
+func (c *saslclient) fail(err error) {
 	c.once.Do(func() {
 		log.WithFields(log.Fields{
 			"client": c,
@@ -231,7 +294,7 @@ func (c *client) fail(err error) {
 	})
 }
 
-func (c *client) failSentRPCs() {
+func (c *saslclient) failSentRPCs() {
 	// channel is closed, clean up awaiting rpcs
 	c.sentM.Lock()
 	sent := c.sent
@@ -249,7 +312,7 @@ func (c *client) failSentRPCs() {
 	}
 }
 
-func (c *client) registerRPC(rpc hrpc.Call) uint32 {
+func (c *saslclient) registerRPC(rpc hrpc.Call) uint32 {
 	currID := atomic.AddUint32(&c.id, 1)
 	c.sentM.Lock()
 	c.sent[currID] = rpc
@@ -257,7 +320,7 @@ func (c *client) registerRPC(rpc hrpc.Call) uint32 {
 	return currID
 }
 
-func (c *client) unregisterRPC(id uint32) hrpc.Call {
+func (c *saslclient) unregisterRPC(id uint32) hrpc.Call {
 	c.sentM.Lock()
 	rpc := c.sent[id]
 	delete(c.sent, id)
@@ -265,7 +328,7 @@ func (c *client) unregisterRPC(id uint32) hrpc.Call {
 	return rpc
 }
 
-func (c *client) processRPCs() {
+func (c *saslclient) processRPCs() {
 	// TODO: flush when the size is too large
 	// TODO: use sync pool for multi
 	// TODO: if multi has only one call, send that call instead
@@ -356,7 +419,7 @@ func returnResult(c hrpc.Call, msg proto.Message, err error) {
 	}
 }
 
-func (c *client) trySend(rpc hrpc.Call) error {
+func (c *saslclient) trySend(rpc hrpc.Call) error {
 	select {
 	case <-c.done:
 		// An unrecoverable error has occured,
@@ -383,7 +446,7 @@ func (c *client) trySend(rpc hrpc.Call) error {
 	}
 }
 
-func (c *client) receiveRPCs() {
+func (c *saslclient) receiveRPCs() {
 	for {
 		select {
 		case <-c.done:
@@ -402,7 +465,7 @@ func (c *client) receiveRPCs() {
 	}
 }
 
-func (c *client) receive() (err error) {
+func (c *saslclient) receive() (err error) {
 	var (
 		sz       [4]byte
 		header   pb.ResponseHeader
@@ -490,19 +553,21 @@ func exceptionToError(class, stack string) error {
 }
 
 // write sends the given buffer to the RegionServer.
-func (c *client) write(buf []byte) error {
+func (c *saslclient) write(buf []byte) error {
+	//TODO: SASL
+
 	_, err := c.conn.Write(buf)
 	return err
 }
 
 // Tries to read enough data to fully fill up the given buffer.
-func (c *client) readFully(buf []byte) error {
+func (c *saslclient) readFully(buf []byte) error {
 	_, err := io.ReadFull(c.conn, buf)
 	return err
 }
 
 // sendHello sends the "hello" message needed when opening a new connection.
-func (c *client) sendHello(ctype ClientType) error {
+func (c *saslclient) sendHello(ctype ClientType) error {
 	connHeader := &pb.ConnectionHeader{
 		UserInfo: &pb.UserInformation{
 			EffectiveUser: proto.String(c.effectiveUser),
@@ -526,7 +591,7 @@ func (c *client) sendHello(ctype ClientType) error {
 
 // send sends an RPC out to the wire.
 // Returns the response (for now, as the call is synchronous).
-func (c *client) send(rpc hrpc.Call) (uint32, error) {
+func (c *saslclient) send(rpc hrpc.Call) (uint32, error) {
 	b := newBuffer(4)
 	defer func() { freeBuffer(b) }()
 
