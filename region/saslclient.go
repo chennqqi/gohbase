@@ -291,8 +291,6 @@ func (p *saslclient) readFrameHeader() (uint32, error) {
 }
 
 func (c *saslclient) receive() (err error) {
-	//TODO::
-
 	var (
 		sz       [4]byte
 		header   pb.ResponseHeader
