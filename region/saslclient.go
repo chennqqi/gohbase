@@ -6,10 +6,10 @@
 package region
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
-	"bytes"
 	"io"
 	"net"
 	"strings"
@@ -101,10 +101,10 @@ func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 	p.saslClient = sasl_client
 
 	// sasl init send
-	if err = p.sendSaslMsg(ctx, START, []byte(saslConf.mechanism)); err != nil {
-		return nil
+	if err = p.sendSaslMsg(ctx, START, []byte(saslConf.MechanismName)); err != nil {
+		return nil, err
 	}
-	
+
 	proccessed, err := p.saslClient.Start()
 	if err != nil {
 		return nil, err
@@ -118,7 +118,7 @@ func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 		if status == OK {
 			proccessed, err = p.saslClient.Step(challenge)
 			if err != nil {
-				return
+				return nil, err
 			}
 			p.sendSaslMsg(ctx, OK, proccessed)
 		} else if status == COMPLETE {
@@ -149,7 +149,7 @@ func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 		go c.processRPCs() // Batching goroutine
 	}
 	go c.receiveRPCs() // Reader goroutine
-	return salc, nil
+	return p, nil
 }
 
 // sendSaslMsg
@@ -168,7 +168,7 @@ func (c *saslclient) sendSaslMsg(ctx context.Context, status uint8, body []byte)
 
 func (p *saslclient) recvSaslMsg(ctx context.Context) (int8, []byte) {
 	header := make([]byte, 5)
-	_, err := p.readFully(header)
+	_, err := p.readFullyEx(header)
 	if err != nil {
 		return ERROR, nil
 	}
@@ -232,7 +232,7 @@ func (c *saslclient) fail(err error) {
 		c.conn.Close()
 
 		c.failSentRPCs()
-		c.saslClient.Close()
+		c.saslClient.Dispose()
 	})
 }
 
@@ -247,7 +247,7 @@ func (p *saslclient) saslRead(buf []byte) (l int, err error) {
 	var got int
 	if p.rawFrameSize > 0 {
 		rawBuf := make([]byte, p.rawFrameSize)
-		got, err = p.readFully(rawBuf)
+		got, err = p.readFullyEx(rawBuf)
 		if err != nil {
 			return
 		}
@@ -280,7 +280,7 @@ func (p *saslclient) saslRead(buf []byte) (l int, err error) {
 
 func (p *saslclient) readFrameHeader() (uint32, error) {
 	buf := p.buffer[:4]
-	if err := p.readFully(buf); err != nil {
+	if _, err := p.readFullyEx(buf); err != nil {
 		return 0, err
 	}
 	size := binary.BigEndian.Uint32(buf)
@@ -370,6 +370,16 @@ func (c *saslclient) receive() (err error) {
 }
 
 // write sends the given buffer to the RegionServer.
+func (c *client) writeEx(buf []byte) (int, error) {
+	return c.conn.Write(buf)
+}
+
+// Tries to read enough data to fully fill up the given buffer.
+func (c *client) readFullyEx(buf []byte) (int, error) {
+	return io.ReadFull(c.conn, buf)
+}
+
+// write sends the given buffer to the RegionServer.
 func (p *saslclient) write(txbuf []byte) error {
 	wrappedBuf, err := p.saslClient.Encode(txbuf)
 	if err != nil {
@@ -386,7 +396,7 @@ func (p *saslclient) write(txbuf []byte) error {
 	}
 
 	if size > 0 {
-		if err := p.client.write(wrappedBuf); err != nil {
+		if n, err := p.client.writeEx(wrappedBuf); err != nil {
 			print("Error while flushing write buffer of size ", size, " to transport, only wrote ", n, " bytes: ", err.Error(), "\n")
 			return err
 		}

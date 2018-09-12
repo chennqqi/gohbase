@@ -613,12 +613,17 @@ func (c *client) establishRegionClient(reg hrpc.RegionInfo,
 	defer cancel()
 
 	switch c.saslMechanism {
-	case "PLAIN":
-		//TODO: newClient with PLAIN
-
-	case "GSSAPI":
+	case "PLAIN", "GSSAPI":
 		//TODO: newClient with kerberos
 		//TODO: master/client with different authentication
+		return region.NewSaslClient(clientCtx, addr, clientType,
+			c.rpcQueueSize, c.flushInterval, c.effectiveUser,
+			c.regionReadTimeout, region.SaslConf{
+				MechanismName: c.saslMechanism,
+				User:          c.saslUser,
+				Pass:          c.saslPass,
+				Service:       c.saslService,
+			})
 
 	default:
 		return region.NewClient(clientCtx, addr, clientType,

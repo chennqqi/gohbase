@@ -176,13 +176,6 @@ func SaslAuthGSSAPI(service string) func(*client) {
 	}
 }
 
-//set sasl principal name
-func SaslPrincipal(principal string) func(*client) {
-	return func(c *client) {
-		c.zkRoot = service
-	}
-}
-
 // RpcQueueSize will return an option that will set the size of the RPC queues
 // used in a given client
 func RpcQueueSize(size int) Option {
