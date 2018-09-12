@@ -57,14 +57,19 @@ type SaslConf struct {
 func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 	queueSize int, flushInterval time.Duration, effectiveUser string,
 	readTimeout time.Duration, saslConf SaslConf) (hrpc.RegionClient, error) {
+
+	connStream := &StdConn{conn, addr}
+
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to the RegionServer at %s: %s", addr, err)
 	}
 	c := &client{
-		addr:          addr,
-		conn:          conn,
+		addr: addr,
+		conn: &StdConn{
+			conn, addr,
+		},
 		rpcs:          make(chan hrpc.Call),
 		done:          make(chan struct{}),
 		sent:          make(map[uint32]hrpc.Call),

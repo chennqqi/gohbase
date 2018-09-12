@@ -9,6 +9,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 )
 
 type Stream interface {
@@ -19,10 +20,13 @@ type Stream interface {
 
 	// Opens the transport for communication
 	Open(ctx context.Context) error
+	SetWriteDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
 }
 
 type StdConn struct {
-	conn    net.Conn
+	net.Conn
+
 	address string
 }
 
@@ -32,9 +36,6 @@ func (p *StdConn) Open(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetWriteDeadline(deadline)
-	}
-	p.conn = conn
+	p.Conn = conn
 	return err
 }

@@ -10,24 +10,43 @@ package region
 import (
 	"context"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/chennqqi/gohbase/hrpc"
 )
 
+type SaslConf struct {
+	MechanismName string
+	User, Pass    string
+	Service       string
+}
+
 // NewClient creates a new RegionClient.
 func NewClient(ctx context.Context, addr string, ctype ClientType,
 	queueSize int, flushInterval time.Duration, effectiveUser string,
 	readTimeout time.Duration) (hrpc.RegionClient, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to the RegionServer at %s: %s", addr, err)
+	return NewClientEx(ctx, addr, ctype, queueSize,
+		flushInterval, effectiveUser, readTimeout, nil)
+}
+
+// NewClient creates a new RegionClient.
+func NewClientEx(ctx context.Context, addr string, ctype ClientType,
+	queueSize int, flushInterval time.Duration, effectiveUser string,
+	readTimeout time.Duration, saslConf *SaslConf) (hrpc.RegionClient, error) {
+
+	var connStream Stream
+	if saslConf != nil {
+		connStream = &SaslConn{
+			address:  addr,
+			SaslConf: *saslConf,
+		}
+	} else {
+		connStream = &StdConn{address: addr}
 	}
+
 	c := &client{
 		addr:          addr,
-		conn:          conn,
+		conn:          connStream,
 		rpcs:          make(chan hrpc.Call),
 		done:          make(chan struct{}),
 		sent:          make(map[uint32]hrpc.Call),
@@ -36,17 +55,22 @@ func NewClient(ctx context.Context, addr string, ctype ClientType,
 		effectiveUser: effectiveUser,
 		readTimeout:   readTimeout,
 	}
+	err := connStream.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// time out send hello if it take long
 	// TODO: do we even need to bother, we are going to retry anyway?
 	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetWriteDeadline(deadline)
+		connStream.SetWriteDeadline(deadline)
 	}
 	if err := c.sendHello(ctype); err != nil {
-		conn.Close()
+		connStream.Close()
 		return nil, fmt.Errorf("failed to send hello to the RegionServer at %s: %s", addr, err)
 	}
 	// reset write deadline
-	conn.SetWriteDeadline(time.Time{})
+	connStream.SetWriteDeadline(time.Time{})
 
 	if ctype == RegionClient {
 		go c.processRPCs() // Batching goroutine

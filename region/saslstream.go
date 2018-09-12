@@ -11,18 +11,29 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
+	"time"
 
 	"github.com/beltran/gosasl"
 	"github.com/pkg/errors"
 )
 
+const (
+	START    = 1
+	OK       = 2
+	BAD      = 3
+	ERROR    = 4
+	COMPLETE = 5
+)
+
 type SaslConn struct {
-	conn       net.Conn
+	address string
+	SaslConf
+
+	conn net.Conn
+
 	saslClient *gosasl.Client
-
-	mechanism string
-
-	readBuf bytes.Buffer
+	readBuf    bytes.Buffer
 
 	buffer       [4]byte
 	maxLength    uint32
@@ -31,25 +42,47 @@ type SaslConn struct {
 }
 
 func (p *SaslConn) Open(ctx context.Context) (err error) {
-	//TODO: Open net.Conn
-	//	if !p.tp.IsOpen() {
-	//		err = p.tp.Open()
-	//		if err != nil {
-	//			return err
-	//		}
-	//	}
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", p.address)
+	if err != nil {
+		return err
+	}
+	p.conn = conn
 
-	if err = p.sendSaslMsg(ctx, START, []byte(p.mechanism)); err != nil {
-		return nil
+	//step 1. sasl init
+	var mechanism gosasl.Mechanism
+	if p.MechanismName == "PLAIN" {
+		mechanism = gosasl.NewPlainMechanism(p.User, p.Pass)
+	} else if p.MechanismName == "GSSAPI" {
+		var err error
+		mechanism, err = gosasl.NewGSSAPIMechanism(p.Service)
+		if err != nil {
+			return err
+		}
+	} else {
+		return errors.New("Mechanism not supported")
+	}
+
+	addrs := strings.Split(p.address, ":")
+	var host string
+	if len(addrs) > 0 {
+		host = addrs[0]
+	} else {
+		return errors.New("NewSaslClient Unknown host")
+	}
+
+	p.saslClient = gosasl.NewSaslClient(host, mechanism)
+	if err = p.sendSaslMsg(ctx, START, []byte(p.MechanismName)); err != nil {
+		return err
 	}
 
 	proccessed, err := p.saslClient.Start()
 	if err != nil {
-		return
+		return err
 	}
 
 	if err = p.sendSaslMsg(ctx, OK, proccessed); err != nil {
-		return nil
+		return err
 	}
 
 	for true {
@@ -57,7 +90,7 @@ func (p *SaslConn) Open(ctx context.Context) (err error) {
 		if status == OK {
 			proccessed, err = p.saslClient.Step(challenge)
 			if err != nil {
-				return
+				return err
 			}
 			p.sendSaslMsg(ctx, OK, proccessed)
 		} else if status == COMPLETE {
@@ -193,4 +226,12 @@ func (p *SaslConn) Write(txbuf []byte) (n int, err error) {
 func (s *SaslConn) Close() error {
 	s.saslClient.Dispose()
 	return s.conn.Close()
+}
+
+func (s *SaslConn) SetWriteDeadline(t time.Time) error {
+	return s.conn.SetWriteDeadline(t)
+}
+
+func (s *SaslConn) SetReadDeadline(t time.Time) error {
+	return s.conn.SetReadDeadline(t)
 }

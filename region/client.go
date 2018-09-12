@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,7 +122,7 @@ func (e RetryableError) Error() string {
 
 // client manages a connection to a RegionServer.
 type client struct {
-	conn net.Conn
+	conn Stream
 
 	// Address of the RegionServer.
 	addr string
