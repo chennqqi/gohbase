@@ -8,13 +8,11 @@ package region
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
+	"bytes"
 	"io"
 	"net"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -23,7 +21,6 @@ import (
 	"github.com/chennqqi/gohbase/hrpc"
 	"github.com/chennqqi/gohbase/pb"
 	"github.com/golang/protobuf/proto"
-	
 	"github.com/pkg/errors"
 )
 
@@ -76,9 +73,6 @@ func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 		effectiveUser: effectiveUser,
 		readTimeout:   readTimeout,
 	}
-	//step 0. init
-	var mechanismName string
-	var configuration map[sring]string
 
 	//step 1. sasl init
 	var mechanism gosasl.Mechanism
@@ -107,13 +101,13 @@ func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 	p.saslClient = sasl_client
 
 	// sasl init send
-	if err = p.sendSaslMsg(ctx, START, []byte(p.mechanism)); err != nil {
+	if err = p.sendSaslMsg(ctx, START, []byte(saslConf.mechanism)); err != nil {
 		return nil
 	}
 	
 	proccessed, err := p.saslClient.Start()
 	if err != nil {
-		return, nil, err
+		return nil, err
 	}
 	if err = p.sendSaslMsg(ctx, OK, proccessed); err != nil {
 		return nil, err
@@ -286,7 +280,7 @@ func (p *saslclient) saslRead(buf []byte) (l int, err error) {
 
 func (p *saslclient) readFrameHeader() (uint32, error) {
 	buf := p.buffer[:4]
-	if _, err := p.readFully(buf); err != nil {
+	if err := p.readFully(buf); err != nil {
 		return 0, err
 	}
 	size := binary.BigEndian.Uint32(buf)
@@ -313,7 +307,7 @@ func (c *saslclient) receive() (err error) {
 	size := binary.BigEndian.Uint32(sz[:])
 	b := make([]byte, size)
 
-	err = c.saslRead(b)
+	_, err = c.saslRead(b)
 	if err != nil {
 		return UnrecoverableError{err}
 	}
@@ -376,8 +370,8 @@ func (c *saslclient) receive() (err error) {
 }
 
 // write sends the given buffer to the RegionServer.
-func (p *saslclient) write(buf []byte) error {
-	wrappedBuf, err := p.saslClient.Encode(buf)
+func (p *saslclient) write(txbuf []byte) error {
+	wrappedBuf, err := p.saslClient.Encode(txbuf)
 	if err != nil {
 		return err
 	}
@@ -386,13 +380,13 @@ func (p *saslclient) write(buf []byte) error {
 	buf := p.buffer[:4]
 	binary.BigEndian.PutUint32(buf, uint32(size))
 
-	_, err = p.client.write(buf)
+	err = p.client.write(buf)
 	if err != nil {
 		return err
 	}
 
 	if size > 0 {
-		if n, err := p.client.write(wrappedBuf); err != nil {
+		if err := p.client.write(wrappedBuf); err != nil {
 			print("Error while flushing write buffer of size ", size, " to transport, only wrote ", n, " bytes: ", err.Error(), "\n")
 			return err
 		}
