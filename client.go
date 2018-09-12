@@ -11,13 +11,13 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/chennqqi/gohbase/hrpc"
 	"github.com/chennqqi/gohbase/pb"
 	"github.com/chennqqi/gohbase/region"
 	"github.com/chennqqi/gohbase/zk"
 	"github.com/cznic/b"
 	"github.com/golang/protobuf/proto"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 

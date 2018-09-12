@@ -14,11 +14,11 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/sirupsen/logrus"
+	log "github.com/Sirupsen/logrus"
 
+	"github.com/chennqqi/gohbase/pb"
 	"github.com/golang/protobuf/proto"
 	"github.com/samuel/go-zookeeper/zk"
-	"github.com/chennqqi/gohbase/pb"
 )
 
 type logger struct{}
