@@ -11,13 +11,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cznic/b"
-	"github.com/golang/protobuf/proto"
-	log "github.com/sirupsen/logrus"
 	"github.com/chennqqi/gohbase/hrpc"
 	"github.com/chennqqi/gohbase/pb"
 	"github.com/chennqqi/gohbase/region"
 	"github.com/chennqqi/gohbase/zk"
+	"github.com/cznic/b"
+	"github.com/golang/protobuf/proto"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
@@ -102,7 +102,11 @@ type client struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	//TODO: kerberos
+	//sasl PLAIN/kerberos
+	saslUser      string //SASL PLAIN
+	saslPass      string //SASL PLAIN
+	saslMechanism string //SASL PALIN/GSSAPI
+	saslService   string //SASL GSSAPI service principle
 }
 
 // NewClient creates a new HBase client.
@@ -146,6 +150,37 @@ func newClient(zkquorum string, options ...Option) *client {
 	c.zkClient = zk.NewClient(zkquorum, c.zkTimeout)
 
 	return c
+}
+
+//set sasl mechanism, accept `PLAIN/GSSAPI`
+//func SaslMechanism(mechanism string) func(*client) {
+//	return func(c *client) {
+//		c.saslMechanism = mechanism
+//	}
+//}
+
+//set sasl plain auth name
+func SaslAuthPlain(user, pass string) func(*client) {
+	return func(c *client) {
+		c.saslUser = user
+		c.saslPass = pass
+		c.saslMechanism = "PLAIN"
+	}
+}
+
+//set sasl GSSAPI(kerberos) auth service name
+func SaslAuthGSSAPI(service string) func(*client) {
+	return func(c *client) {
+		c.saslService = service
+		c.saslMechanism = "GSSAPI"
+	}
+}
+
+//set sasl principal name
+func SaslPrincipal(principal string) func(*client) {
+	return func(c *client) {
+		c.zkRoot = service
+	}
 }
 
 // RpcQueueSize will return an option that will set the size of the RPC queues

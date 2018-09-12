@@ -6,11 +6,13 @@
 package region
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,150 +20,46 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/beltran/gosasl"
-	"github.com/golang/protobuf/proto"
 	"github.com/chennqqi/gohbase/hrpc"
 	"github.com/chennqqi/gohbase/pb"
-)
-
-// ClientType is a type alias to represent the type of this region client
-type ClientType string
-
-type canDeserializeCellBlocks interface {
-	// DeserializeCellBlocks populates passed protobuf message with results
-	// deserialized from the reader and returns number of bytes read or error.
-	DeserializeCellBlocks(proto.Message, []byte) (uint32, error)
-}
-
-var (
-	// ErrMissingCallID is used when HBase sends us a response message for a
-	// request that we didn't send
-	ErrMissingCallID = errors.New("got a response with a nonsensical call ID")
-
-	// ErrClientDead is returned to rpcs when Close() is called or when client
-	// died because of failed send or receive
-	ErrClientDead = UnrecoverableError{errors.New("client is dead")}
-
-	// javaRetryableExceptions is a map where all Java exceptions that signify
-	// the RPC should be sent again are listed (as keys). If a Java exception
-	// listed here is returned by HBase, the client should attempt to resend
-	// the RPC message, potentially via a different region client.
-	javaRetryableExceptions = map[string]struct{}{
-		"org.apache.hadoop.hbase.CallQueueTooBigException":          struct{}{},
-		"org.apache.hadoop.hbase.NotServingRegionException":         struct{}{},
-		"org.apache.hadoop.hbase.exceptions.RegionMovedException":   struct{}{},
-		"org.apache.hadoop.hbase.exceptions.RegionOpeningException": struct{}{},
-		"org.apache.hadoop.hbase.ipc.ServerNotRunningYetException":  struct{}{},
-		"org.apache.hadoop.hbase.quotas.RpcThrottlingException":     struct{}{},
-		"org.apache.hadoop.hbase.RetryImmediatelyException":         struct{}{},
-	}
-
-	// javaUnrecoverableExceptions is a map where all Java exceptions that signify
-	// the RPC should be sent again are listed (as keys). If a Java exception
-	// listed here is returned by HBase, the RegionClient will be closed and a new
-	// one should be established.
-	javaUnrecoverableExceptions = map[string]struct{}{
-		"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException": struct{}{},
-		"org.apache.hadoop.hbase.regionserver.RegionServerStoppedException": struct{}{},
-	}
+	"github.com/golang/protobuf/proto"
+	
+	"github.com/pkg/errors"
 )
 
 const (
-	//DefaultLookupTimeout is the default region lookup timeout
-	DefaultLookupTimeout = 30 * time.Second
-	//DefaultReadTimeout is the default region read timeout
-	DefaultReadTimeout = 30 * time.Second
-	// RegionClient is a ClientType that means this will be a normal client
-	RegionClient = ClientType("ClientService")
-
-	// MasterClient is a ClientType that means this client will talk to the
-	// master server
-	MasterClient = ClientType("MasterService")
+	START    = 1
+	OK       = 2
+	BAD      = 3
+	ERROR    = 4
+	COMPLETE = 5
 )
-
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		var b []byte
-		return b
-	},
-}
-
-func newBuffer(size int) []byte {
-	b := bufferPool.Get().([]byte)
-	if cap(b) < size {
-		doublecap := 2 * cap(b)
-		if doublecap > size {
-			return make([]byte, size, doublecap)
-		}
-		return make([]byte, size)
-	}
-	return b[:size]
-}
-
-func freeBuffer(b []byte) {
-	bufferPool.Put(b[:0])
-}
-
-// UnrecoverableError is an error that this region.Client can't recover from.
-// The connection to the RegionServer has to be closed and all queued and
-// outstanding RPCs will be failed / retried.
-type UnrecoverableError struct {
-	error
-}
-
-func (e UnrecoverableError) Error() string {
-	return e.error.Error()
-}
-
-// RetryableError is an error that indicates the RPC should be retried because
-// the error is transient (e.g. a region being momentarily unavailable).
-type RetryableError struct {
-	error
-}
-
-func (e RetryableError) Error() string {
-	return e.error.Error()
-}
 
 // client manages a connection to a RegionServer.
 type saslclient struct {
+	*client
+
 	// sasl client
 	saslClient *gosasl.Client
 
-	conn net.Conn
+	readBuf bytes.Buffer
 
-	// Address of the RegionServer.
-	addr string
+	buffer       [4]byte
+	maxLength    uint32
+	rawFrameSize uint32 //Current remaining size of the frame. if ==0 read next frame header
+	frameSize    int    //Current remaining size of the frame. if ==0 read next frame header
+}
 
-	// once used for concurrent calls to fail
-	once sync.Once
-
-	rpcs chan hrpc.Call
-	done chan struct{}
-
-	// sent contains the mapping of sent call IDs to RPC calls, so that when
-	// a response is received it can be tied to the correct RPC
-	sentM sync.Mutex // protects sent
-	sent  map[uint32]hrpc.Call
-
-	// inFlight is number of rpcs sent to regionserver awaiting response
-	inFlightM sync.Mutex // protects inFlight and SetReadDeadline
-	inFlight  uint32
-
-	id uint32
-
-	rpcQueueSize  int
-	flushInterval time.Duration
-
-	effectiveUser string
-
-	// readTimeout is the maximum amount of time to wait for regionserver reply
-	readTimeout time.Duration
+type SaslConf struct {
+	MechanismName string
+	User, Pass    string
+	Service       string
 }
 
 // NewClient creates a new RegionClient.
 func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 	queueSize int, flushInterval time.Duration, effectiveUser string,
-	readTimeout time.Duration) (hrpc.RegionClient, error) {
+	readTimeout time.Duration, saslConf SaslConf) (hrpc.RegionClient, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -184,19 +82,62 @@ func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 
 	//step 1. sasl init
 	var mechanism gosasl.Mechanism
-	if mechanismName == "PLAIN" {
-		mechanism = gosasl.NewPlainMechanism(configuration["username"], configuration["password"])
-	} else if mechanismName == "GSSAPI" {
+	if saslConf.MechanismName == "PLAIN" {
+		mechanism = gosasl.NewPlainMechanism(saslConf.User, saslConf.Pass)
+	} else if saslConf.MechanismName == "GSSAPI" {
 		var err error
-		mechanism, err = gosasl.NewGSSAPIMechanism(configuration["service"])
+		mechanism, err = gosasl.NewGSSAPIMechanism(saslConf.Service)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		panic("Mechanism not supported")
+		return nil, errors.New("Mechanism not supported")
+	}
+	addrs := strings.Split(addr, ":")
+	var host string
+	if len(addrs) > 0 {
+		host = addrs[0]
+	} else {
+		return nil, errors.New("NewSaslClient Unknown host")
 	}
 	sasl_client := gosasl.NewSaslClient(host, mechanism)
-	c
+
+	p := &saslclient{}
+	p.client = c
+	p.saslClient = sasl_client
+
+	// sasl init send
+	if err = p.sendSaslMsg(ctx, START, []byte(p.mechanism)); err != nil {
+		return nil
+	}
+	
+	proccessed, err := p.saslClient.Start()
+	if err != nil {
+		return, nil, err
+	}
+	if err = p.sendSaslMsg(ctx, OK, proccessed); err != nil {
+		return nil, err
+	}
+
+	for {
+		status, challenge := p.recvSaslMsg(ctx)
+		if status == OK {
+			proccessed, err = p.saslClient.Step(challenge)
+			if err != nil {
+				return
+			}
+			p.sendSaslMsg(ctx, OK, proccessed)
+		} else if status == COMPLETE {
+			if !p.saslClient.Complete() {
+				return nil, errors.New("The server erroneously indicated that SASL negotiation was complete")
+			}
+			break
+		} else {
+			return nil, errors.New("The server erroneously indicated that SASL negotiation was complete")
+
+			return nil, errors.Errorf("Bad SASL negotiation status: %d (%s)", status, challenge)
+		}
+	}
 
 	// time out send hello if it take long
 	// TODO: do we even need to bother, we are going to retry anyway?
@@ -214,7 +155,42 @@ func NewSaslClient(ctx context.Context, addr string, ctype ClientType,
 		go c.processRPCs() // Batching goroutine
 	}
 	go c.receiveRPCs() // Reader goroutine
-	return c, nil
+	return salc, nil
+}
+
+// sendSaslMsg
+func (c *saslclient) sendSaslMsg(ctx context.Context, status uint8, body []byte) error {
+	header := make([]byte, 5)
+	header[0] = status
+	length := uint32(len(body))
+	binary.BigEndian.PutUint32(header[1:], length)
+
+	err := c.client.write(append(header[:], body[:]...))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *saslclient) recvSaslMsg(ctx context.Context) (int8, []byte) {
+	header := make([]byte, 5)
+	_, err := p.readFully(header)
+	if err != nil {
+		return ERROR, nil
+	}
+
+	status := int8(header[0])
+	length := binary.BigEndian.Uint32(header[1:])
+
+	if length > 0 {
+		payload := make([]byte, length)
+		_, err = io.ReadFull(p.conn, payload)
+		if err != nil {
+			return ERROR, nil
+		}
+		return status, payload
+	}
+	return status, nil
 }
 
 // QueueRPC will add an rpc call to the queue for processing by the writer goroutine
@@ -242,35 +218,6 @@ func (c *saslclient) Close() {
 	c.fail(ErrClientDead)
 }
 
-// Addr returns address of the region server the client is connected to
-func (c *saslclient) Addr() string {
-	return c.addr
-}
-
-// String returns a string represintation of the current region client
-func (c *saslclient) String() string {
-	return fmt.Sprintf("RegionClient{Addr: %s}", c.addr)
-}
-
-func (c *saslclient) inFlightUp() {
-	c.inFlightM.Lock()
-	c.inFlight++
-	// we expect that at least the last request can be completed within readTimeout
-	c.conn.SetReadDeadline(time.Now().Add(c.readTimeout))
-	c.inFlightM.Unlock()
-}
-
-func (c *saslclient) inFlightDown() {
-	c.inFlightM.Lock()
-	c.inFlight--
-	// reset read timeout if we are not waiting for any responses
-	// in order to prevent from closing this client if there are no request
-	if c.inFlight == 0 {
-		c.conn.SetReadDeadline(time.Time{})
-	}
-	c.inFlightM.Unlock()
-}
-
 func (c *saslclient) fail(err error) {
 	c.once.Do(func() {
 		log.WithFields(log.Fields{
@@ -291,181 +238,67 @@ func (c *saslclient) fail(err error) {
 		c.conn.Close()
 
 		c.failSentRPCs()
+		c.saslClient.Close()
 	})
 }
 
-func (c *saslclient) failSentRPCs() {
-	// channel is closed, clean up awaiting rpcs
-	c.sentM.Lock()
-	sent := c.sent
-	c.sent = make(map[uint32]hrpc.Call)
-	c.sentM.Unlock()
-
-	log.WithFields(log.Fields{
-		"client": c,
-		"count":  len(sent),
-	}).Debug("failing awaiting RPCs")
-
-	// send error to awaiting rpcs
-	for _, rpc := range sent {
-		returnResult(rpc, nil, ErrClientDead)
-	}
-}
-
-func (c *saslclient) registerRPC(rpc hrpc.Call) uint32 {
-	currID := atomic.AddUint32(&c.id, 1)
-	c.sentM.Lock()
-	c.sent[currID] = rpc
-	c.sentM.Unlock()
-	return currID
-}
-
-func (c *saslclient) unregisterRPC(id uint32) hrpc.Call {
-	c.sentM.Lock()
-	rpc := c.sent[id]
-	delete(c.sent, id)
-	c.sentM.Unlock()
-	return rpc
-}
-
-func (c *saslclient) processRPCs() {
-	// TODO: flush when the size is too large
-	// TODO: use sync pool for multi
-	// TODO: if multi has only one call, send that call instead
-	m := newMulti(c.rpcQueueSize)
-	defer func() {
-		m.returnResults(nil, ErrClientDead)
-	}()
-
-	flush := func() {
-		if log.GetLevel() == log.DebugLevel {
-			log.WithFields(log.Fields{
-				"len":  m.len(),
-				"addr": c.Addr(),
-			}).Debug("flushing MultiRequest")
-		}
-		if err := c.trySend(m); err != nil {
-			m.returnResults(nil, err)
-		}
-		m = newMulti(c.rpcQueueSize)
-	}
-
-	for {
-		// first loop is to accomodate request heavy workload
-		// it will batch as long as conccurent writers are sending
-		// new rpcs or until multi is filled up
-		for {
-			select {
-			case <-c.done:
-				return
-			case rpc := <-c.rpcs:
-				// have things queued up, batch them
-				if !m.add(rpc) {
-					// can still put more rpcs into batch
-					continue
-				}
-			default:
-				// no more rpcs queued up
-			}
-			break
-		}
-
-		if l := m.len(); l == 0 {
-			// wait for the next batch
-			select {
-			case <-c.done:
-				return
-			case rpc := <-c.rpcs:
-				m.add(rpc)
-			}
-			continue
-		} else if l == c.rpcQueueSize || c.flushInterval == 0 {
-			// batch is full, flush
-			flush()
-			continue
-		}
-
-		// second loop is to accomodate less frequent callers
-		// that would like to maximize their batches at the expense
-		// of waiting for flushInteval
-		timer := time.NewTimer(c.flushInterval)
-		for {
-			select {
-			case <-c.done:
-				return
-			case <-timer.C:
-				// time to flush
-			case rpc := <-c.rpcs:
-				if !m.add(rpc) {
-					// can still put more rpcs into batch
-					continue
-				}
-				// batch is full
-				if !timer.Stop() {
-					<-timer.C
-				}
-			}
-			break
-		}
-		flush()
-	}
-}
-
-func returnResult(c hrpc.Call, msg proto.Message, err error) {
-	if m, ok := c.(*multi); ok {
-		m.returnResults(msg, err)
-	} else {
-		c.ResultChan() <- hrpc.RPCResult{Msg: msg, Error: err}
-	}
-}
-
-func (c *saslclient) trySend(rpc hrpc.Call) error {
-	select {
-	case <-c.done:
-		// An unrecoverable error has occured,
-		// region client has been stopped,
-		// don't send rpcs
-		return ErrClientDead
-	case <-rpc.Context().Done():
-		// If the deadline has been exceeded, don't bother sending the
-		// request. The function that placed the RPC in our queue should
-		// stop waiting for a result and return an error.
-		return nil
-	default:
-		if id, err := c.send(rpc); err != nil {
-			if _, ok := err.(UnrecoverableError); ok {
-				c.fail(err)
-			}
-			if r := c.unregisterRPC(id); r != nil {
-				// we are the ones to unregister the rpc,
-				// return err to notify client of it
-				return err
-			}
-		}
-		return nil
-	}
-}
-
-func (c *saslclient) receiveRPCs() {
-	for {
-		select {
-		case <-c.done:
+func (p *saslclient) saslRead(buf []byte) (l int, err error) {
+	if p.rawFrameSize == 0 && p.frameSize == 0 {
+		p.rawFrameSize, err = p.readFrameHeader()
+		if err != nil {
 			return
-		default:
-			if err := c.receive(); err != nil {
-				switch err.(type) {
-				case UnrecoverableError:
-					c.fail(err)
-					return
-				case RetryableError:
-					continue
-				}
-			}
 		}
 	}
+
+	var got int
+	if p.rawFrameSize > 0 {
+		rawBuf := make([]byte, p.rawFrameSize)
+		got, err = p.readFully(rawBuf)
+		if err != nil {
+			return
+		}
+		p.rawFrameSize = p.rawFrameSize - uint32(got)
+
+		var unwrappedBuf []byte
+		unwrappedBuf, err = p.saslClient.Decode(rawBuf)
+		if err != nil {
+			return
+		}
+		p.frameSize += len(unwrappedBuf)
+		p.readBuf.Write(unwrappedBuf)
+	}
+
+	// totalBytes := p.readBuf.Len()
+	got, err = p.readBuf.Read(buf)
+	p.frameSize = p.frameSize - got
+
+	/*
+		if p.readBuf.Len() > 0 {
+			err = thrift.NewTTransportExceptionFromError(fmt.Errorf("Not enough frame size %d to read %d bytes", p.frameSize, totalBytes))
+			return
+		}
+	*/
+	if p.frameSize < 0 {
+		return 0, errors.New("Negative frame size")
+	}
+	return got, err
+}
+
+func (p *saslclient) readFrameHeader() (uint32, error) {
+	buf := p.buffer[:4]
+	if _, err := p.readFully(buf); err != nil {
+		return 0, err
+	}
+	size := binary.BigEndian.Uint32(buf)
+	if size < 0 || size > p.maxLength {
+		return 0, errors.Errorf("Incorrect frame size (%d)", size)
+	}
+	return size, nil
 }
 
 func (c *saslclient) receive() (err error) {
+	//TODO::
+
 	var (
 		sz       [4]byte
 		header   pb.ResponseHeader
@@ -480,7 +313,7 @@ func (c *saslclient) receive() (err error) {
 	size := binary.BigEndian.Uint32(sz[:])
 	b := make([]byte, size)
 
-	err = c.readFully(b)
+	err = c.saslRead(b)
 	if err != nil {
 		return UnrecoverableError{err}
 	}
@@ -542,91 +375,27 @@ func (c *saslclient) receive() (err error) {
 	return
 }
 
-func exceptionToError(class, stack string) error {
-	err := fmt.Errorf("HBase Java exception %s:\n%s", class, stack)
-	if _, ok := javaRetryableExceptions[class]; ok {
-		return RetryableError{err}
-	} else if _, ok := javaUnrecoverableExceptions[class]; ok {
-		return UnrecoverableError{err}
-	}
-	return err
-}
-
 // write sends the given buffer to the RegionServer.
-func (c *saslclient) write(buf []byte) error {
-	//TODO: SASL
-
-	_, err := c.conn.Write(buf)
-	return err
-}
-
-// Tries to read enough data to fully fill up the given buffer.
-func (c *saslclient) readFully(buf []byte) error {
-	_, err := io.ReadFull(c.conn, buf)
-	return err
-}
-
-// sendHello sends the "hello" message needed when opening a new connection.
-func (c *saslclient) sendHello(ctype ClientType) error {
-	connHeader := &pb.ConnectionHeader{
-		UserInfo: &pb.UserInformation{
-			EffectiveUser: proto.String(c.effectiveUser),
-		},
-		ServiceName:         proto.String(string(ctype)),
-		CellBlockCodecClass: proto.String("org.apache.hadoop.hbase.codec.KeyValueCodec"),
-	}
-	data, err := proto.Marshal(connHeader)
+func (p *saslclient) write(buf []byte) error {
+	wrappedBuf, err := p.saslClient.Encode(buf)
 	if err != nil {
-		return fmt.Errorf("failed to marshal connection header: %s", err)
+		return err
 	}
 
-	const header = "HBas\x00\x50" // \x50 = Simple Auth.
-	buf := make([]byte, 0, len(header)+4+len(data))
-	buf = append(buf, header...)
-	buf = buf[:len(header)+4]
-	binary.BigEndian.PutUint32(buf[6:], uint32(len(data)))
-	buf = append(buf, data...)
-	return c.write(buf)
-}
+	size := len(wrappedBuf)
+	buf := p.buffer[:4]
+	binary.BigEndian.PutUint32(buf, uint32(size))
 
-// send sends an RPC out to the wire.
-// Returns the response (for now, as the call is synchronous).
-func (c *saslclient) send(rpc hrpc.Call) (uint32, error) {
-	b := newBuffer(4)
-	defer func() { freeBuffer(b) }()
-
-	buf := proto.NewBuffer(b[4:])
-	buf.Reset()
-
-	request := rpc.ToProto()
-
-	// we have to register rpc after we marhsal because
-	// registered rpc can fail before it was even sent
-	// in all the cases where c.fail() is called.
-	// If that happens, client can retry sending the rpc
-	// again potentially changing it's contents.
-	id := c.registerRPC(rpc)
-
-	header := &pb.RequestHeader{
-		CallId:       &id,
-		MethodName:   proto.String(rpc.Name()),
-		RequestParam: proto.Bool(true),
-	}
-	if err := buf.EncodeMessage(header); err != nil {
-		return id, fmt.Errorf("failed to marshal request header: %s", err)
+	_, err = p.client.write(buf)
+	if err != nil {
+		return err
 	}
 
-	if err := buf.EncodeMessage(request); err != nil {
-		return id, fmt.Errorf("failed to marshal request: %s", err)
+	if size > 0 {
+		if n, err := p.client.write(wrappedBuf); err != nil {
+			print("Error while flushing write buffer of size ", size, " to transport, only wrote ", n, " bytes: ", err.Error(), "\n")
+			return err
+		}
 	}
-
-	payload := buf.Bytes()
-	binary.BigEndian.PutUint32(b, uint32(len(payload)))
-	b = append(b[:4], payload...)
-
-	if err := c.write(b); err != nil {
-		return id, UnrecoverableError{err}
-	}
-	c.inFlightUp()
-	return id, nil
+	return nil
 }

@@ -14,11 +14,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	log "github.com/sirupsen/logrus"
 	"github.com/chennqqi/gohbase/hrpc"
 	"github.com/chennqqi/gohbase/region"
 	"github.com/chennqqi/gohbase/zk"
+	"github.com/golang/protobuf/proto"
+	log "github.com/sirupsen/logrus"
 )
 
 // Constants
@@ -612,9 +612,19 @@ func (c *client) establishRegionClient(reg hrpc.RegionInfo,
 	clientCtx, cancel := context.WithTimeout(reg.Context(), c.regionLookupTimeout)
 	defer cancel()
 
-	return region.NewClient(clientCtx, addr, clientType,
-		c.rpcQueueSize, c.flushInterval, c.effectiveUser,
-		c.regionReadTimeout)
+	switch c.saslMechanism {
+	case "PLAIN":
+		//TODO: newClient with PLAIN
+
+	case "GSSAPI":
+		//TODO: newClient with kerberos
+		//TODO: master/client with different authentication
+
+	default:
+		return region.NewClient(clientCtx, addr, clientType,
+			c.rpcQueueSize, c.flushInterval, c.effectiveUser,
+			c.regionReadTimeout)
+	}
 }
 
 // zkResult contains the result of a ZooKeeper lookup (when we're looking for
