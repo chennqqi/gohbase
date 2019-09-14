@@ -14,17 +14,18 @@ import (
 
 // DisableTable represents a DisableTable HBase call
 type DisableTable struct {
-	tableOp
+	base
 }
 
 // NewDisableTable creates a new DisableTable request that will disable the
 // given table in HBase. For use by the admin client.
 func NewDisableTable(ctx context.Context, table []byte) *DisableTable {
 	return &DisableTable{
-		tableOp{base{
-			table: table,
-			ctx:   ctx,
-		}},
+		base{
+			table:    table,
+			ctx:      ctx,
+			resultch: make(chan RPCResult, 1),
+		},
 	}
 }
 
@@ -34,14 +35,14 @@ func (dt *DisableTable) Name() string {
 }
 
 // ToProto converts the RPC into a protobuf message
-func (dt *DisableTable) ToProto() (proto.Message, error) {
+func (dt *DisableTable) ToProto() proto.Message {
 	return &pb.DisableTableRequest{
 		TableName: &pb.TableName{
 			// TODO: handle namespaces
 			Namespace: []byte("default"),
 			Qualifier: dt.table,
 		},
-	}, nil
+	}
 }
 
 // NewResponse creates an empty protobuf message to read the response of this

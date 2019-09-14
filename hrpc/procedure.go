@@ -7,10 +7,8 @@ package hrpc
 
 import (
 	"context"
-	"errors"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/filter"
 	"github.com/tsuna/gohbase/pb"
 )
 
@@ -24,7 +22,10 @@ type GetProcedureState struct {
 // NewGetProcedureState creates a new GetProcedureState request. For use by the admin client.
 func NewGetProcedureState(ctx context.Context, procID uint64) *GetProcedureState {
 	return &GetProcedureState{
-		base:   base{ctx: ctx},
+		base: base{
+			ctx:      ctx,
+			resultch: make(chan RPCResult, 1),
+		},
 		procID: procID,
 	}
 }
@@ -35,21 +36,11 @@ func (ps *GetProcedureState) Name() string {
 }
 
 // ToProto converts the RPC into a protobuf message
-func (ps *GetProcedureState) ToProto() (proto.Message, error) {
-	return &pb.GetProcedureResultRequest{ProcId: &ps.procID}, nil
+func (ps *GetProcedureState) ToProto() proto.Message {
+	return &pb.GetProcedureResultRequest{ProcId: &ps.procID}
 }
 
 // NewResponse creates an empty protobuf message to read the response of this RPC.
 func (ps *GetProcedureState) NewResponse() proto.Message {
 	return &pb.GetProcedureResultResponse{}
-}
-
-// SetFilter always returns an error.
-func (ps *GetProcedureState) SetFilter(filter.Filter) error {
-	return errors.New("cannot set filter on admin operations")
-}
-
-// SetFamilies always returns an error.
-func (ps *GetProcedureState) SetFamilies(map[string][]string) error {
-	return errors.New("cannot set families on admin operations")
 }

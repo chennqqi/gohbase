@@ -8,7 +8,10 @@ package gohbase
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/cznic/b"
@@ -25,7 +28,16 @@ const (
 	defaultRPCQueueSize  = 100
 	defaultFlushInterval = 20 * time.Millisecond
 	defaultZkRoot        = "/hbase"
+	defaultZkTimeout     = 30 * time.Second
 	defaultEffectiveUser = "root"
+	// metaBurst is maxmium number of request allowed at once.
+	metaBurst = 100
+)
+
+var (
+	// metaLimit is rate at which to throttle requests to hbase:meta table.
+	// 100 request per 100 milliseconds.
+	metaLimit = 100 * rate.Every(100*time.Millisecond)
 )
 
 // Client a regular HBase client
@@ -71,11 +83,28 @@ type client struct {
 	// The root zookeeper path for Hbase. By default, this is usually "/hbase".
 	zkRoot string
 
+	// The zookeeper session timeout
+	zkTimeout time.Duration
+
 	// The timeout before flushing the RPC queue in the region client
 	flushInterval time.Duration
 
 	// The user used when accessing regions.
 	effectiveUser string
+
+	// metaLookupLimiter is used to throttle lookups to hbase:meta table
+	metaLookupLimiter *rate.Limiter
+
+	// How long to wait for a region lookup (either meta lookup or finding
+	// meta in ZooKeeper).  Should be greater than or equal to the ZooKeeper
+	// session timeout.
+	regionLookupTimeout time.Duration
+
+	// regionReadTimeout is the maximum amount of time to wait for regionserver reply
+	regionReadTimeout time.Duration
+
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewClient creates a new HBase client.
@@ -102,13 +131,22 @@ func newClient(zkquorum string, options ...Option) *client {
 			[]byte("hbase:meta,,1"),
 			nil,
 			nil),
-		zkRoot:        defaultZkRoot,
-		zkClient:      zk.NewClient(zkquorum),
-		effectiveUser: defaultEffectiveUser,
+		zkRoot:              defaultZkRoot,
+		zkTimeout:           defaultZkTimeout,
+		effectiveUser:       defaultEffectiveUser,
+		metaLookupLimiter:   rate.NewLimiter(metaLimit, metaBurst),
+		regionLookupTimeout: region.DefaultLookupTimeout,
+		regionReadTimeout:   region.DefaultReadTimeout,
+		done:                make(chan struct{}),
 	}
 	for _, option := range options {
 		option(c)
 	}
+
+	//Have to create the zkClient after the Options have been set
+	//since the zkTimeout could be changed as an option
+	c.zkClient = zk.NewClient(zkquorum, c.zkTimeout)
+
 	return c
 }
 
@@ -124,6 +162,27 @@ func RpcQueueSize(size int) Option {
 func ZookeeperRoot(root string) Option {
 	return func(c *client) {
 		c.zkRoot = root
+	}
+}
+
+// ZookeeperTimeout will return an option that will set the zookeeper session timeout.
+func ZookeeperTimeout(to time.Duration) Option {
+	return func(c *client) {
+		c.zkTimeout = to
+	}
+}
+
+// RegionLookupTimeout will return an option that sets the region lookup timeout
+func RegionLookupTimeout(to time.Duration) Option {
+	return func(c *client) {
+		c.regionLookupTimeout = to
+	}
+}
+
+// RegionReadTimeout will return an option that sets the region read timeout
+func RegionReadTimeout(to time.Duration) Option {
+	return func(c *client) {
+		c.regionReadTimeout = to
 	}
 }
 
@@ -144,17 +203,15 @@ func FlushInterval(interval time.Duration) Option {
 
 // Close closes connections to hbase master and regionservers
 func (c *client) Close() {
-	// TODO: do we need a lock for metaRegionInfo and adminRegionInfo
-	if c.clientType == adminClient {
-		if ac := c.adminRegionInfo.Client(); ac != nil {
-			ac.Close()
+	c.closeOnce.Do(func() {
+		close(c.done)
+		if c.clientType == adminClient {
+			if ac := c.adminRegionInfo.Client(); ac != nil {
+				ac.Close()
+			}
 		}
-	} else {
-		if mc := c.metaRegionInfo.Client(); mc != nil {
-			mc.Close()
-		}
-	}
-	c.clients.closeAll()
+		c.clients.closeAll()
+	})
 }
 
 func (c *client) Scan(s *hrpc.Scan) hrpc.Scanner {

@@ -7,18 +7,15 @@ package hrpc
 
 import (
 	"context"
-	"io"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/filter"
 	"github.com/tsuna/gohbase/pb"
 )
 
 // Get represents a Get HBase call.
 type Get struct {
 	base
-
-	families map[string][]string //Maps a column family to a list of qualifiers
+	baseQuery
 
 	// Return the row for the given key or, if this key doesn't exist,
 	// whichever key happens to be right before.
@@ -28,12 +25,7 @@ type Get struct {
 	// table or not.
 	existsOnly bool
 
-	fromTimestamp uint64
-	toTimestamp   uint64
-
-	maxVersions uint32
-
-	filters filter.Filter
+	skipbatch bool
 }
 
 // baseGet returns a Get struct with default values set.
@@ -41,13 +33,12 @@ func baseGet(ctx context.Context, table []byte, key []byte,
 	options ...func(Call) error) (*Get, error) {
 	g := &Get{
 		base: base{
-			key:   key,
-			table: table,
-			ctx:   ctx,
+			key:      key,
+			table:    table,
+			ctx:      ctx,
+			resultch: make(chan RPCResult, 1),
 		},
-		fromTimestamp: MinTimestamp,
-		toTimestamp:   MaxTimestamp,
-		maxVersions:   DefaultMaxVersions,
+		baseQuery: newBaseQuery(),
 	}
 	err := applyOptions(g, options...)
 	if err != nil {
@@ -85,28 +76,14 @@ func (g *Get) Name() string {
 	return "Get"
 }
 
-// Filter returns the filter of this Get request.
-func (g *Get) Filter() filter.Filter {
-	return g.filters
+// SkipBatch returns true if the Get request shouldn't be batched,
+// but should be sent to Region Server right away.
+func (g *Get) SkipBatch() bool {
+	return g.skipbatch
 }
 
-// Families returns the families to retrieve with this Get request.
-func (g *Get) Families() map[string][]string {
-	return g.families
-}
-
-// SetFilter sets filter to use for this Get request.
-func (g *Get) SetFilter(f filter.Filter) error {
-	g.filters = f
-	// TODO: Validation?
-	return nil
-}
-
-// SetFamilies sets families to retrieve with this Get request.
-func (g *Get) SetFamilies(f map[string][]string) error {
-	g.families = f
-	// TODO: Validation?
-	return nil
+func (g *Get) setSkipBatch(v bool) {
+	g.skipbatch = v
 }
 
 // ExistsOnly makes this Get request not return any KeyValue, merely whether
@@ -116,7 +93,7 @@ func (g *Get) ExistsOnly() {
 }
 
 // ToProto converts this RPC into a protobuf message.
-func (g *Get) ToProto() (proto.Message, error) {
+func (g *Get) ToProto() proto.Message {
 	get := &pb.GetRequest{
 		Region: g.regionSpecifier(),
 		Get: &pb.Get{
@@ -125,6 +102,15 @@ func (g *Get) ToProto() (proto.Message, error) {
 			TimeRange: &pb.TimeRange{},
 		},
 	}
+
+	/* added support for limit number of cells per row */
+	if g.storeLimit != DefaultMaxResultsPerColumnFamily {
+		get.Get.StoreLimit = &g.storeLimit
+	}
+	if g.storeOffset != 0 {
+		get.Get.StoreOffset = &g.storeOffset
+	}
+
 	if g.maxVersions != DefaultMaxVersions {
 		get.Get.MaxVersions = &g.maxVersions
 	}
@@ -140,14 +126,8 @@ func (g *Get) ToProto() (proto.Message, error) {
 	if g.existsOnly {
 		get.Get.ExistenceOnly = proto.Bool(true)
 	}
-	if g.filters != nil {
-		pbFilter, err := g.filters.ConstructPBFilter()
-		if err != nil {
-			return nil, err
-		}
-		get.Get.Filter = pbFilter
-	}
-	return get, nil
+	get.Get.Filter = g.filter
+	return get
 }
 
 // NewResponse creates an empty protobuf message to read the response of this
@@ -157,18 +137,18 @@ func (g *Get) NewResponse() proto.Message {
 }
 
 // DeserializeCellBlocks deserializes get result from cell blocks
-func (g *Get) DeserializeCellBlocks(m proto.Message, r io.Reader, cellsLen uint32) error {
-	getResp := m.(*pb.GetResponse)
-	if getResp.Result == nil {
+func (g *Get) DeserializeCellBlocks(m proto.Message, b []byte) (uint32, error) {
+	resp := m.(*pb.GetResponse)
+	if resp.Result == nil {
 		// TODO: is this possible?
-		return nil
+		return 0, nil
 	}
-	cells, err := deserializeCellBlocks(r, cellsLen)
+	cells, read, err := deserializeCellBlocks(b, uint32(resp.Result.GetAssociatedCellCount()))
 	if err != nil {
-		return err
+		return 0, err
 	}
-	getResp.Result.Cell = append(getResp.Result.Cell, cells...)
-	return nil
+	resp.Result.Cell = append(resp.Result.Cell, cells...)
+	return read, nil
 }
 
 // familiesToColumn takes a map from strings to lists of strings, and converts

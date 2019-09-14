@@ -14,17 +14,18 @@ import (
 
 // EnableTable represents a EnableTable HBase call
 type EnableTable struct {
-	tableOp
+	base
 }
 
 // NewEnableTable creates a new EnableTable request that will enable the
 // given table in HBase. For use by the admin client.
 func NewEnableTable(ctx context.Context, table []byte) *EnableTable {
 	return &EnableTable{
-		tableOp{base{
-			table: table,
-			ctx:   ctx,
-		}},
+		base{
+			table:    table,
+			ctx:      ctx,
+			resultch: make(chan RPCResult, 1),
+		},
 	}
 }
 
@@ -34,14 +35,14 @@ func (et *EnableTable) Name() string {
 }
 
 // ToProto converts the RPC into a protobuf message
-func (et *EnableTable) ToProto() (proto.Message, error) {
+func (et *EnableTable) ToProto() proto.Message {
 	return &pb.EnableTableRequest{
 		TableName: &pb.TableName{
 			// TODO: handle namespaces
 			Namespace: []byte("default"),
 			Qualifier: et.table,
 		},
-	}, nil
+	}
 }
 
 // NewResponse creates an empty protobuf message to read the response of this

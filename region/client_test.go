@@ -8,17 +8,22 @@ package region
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/aristanetworks/goarista/test"
+	atest "github.com/aristanetworks/goarista/test"
 	"github.com/golang/mock/gomock"
 	"github.com/golang/protobuf/proto"
 	"github.com/tsuna/gohbase/hrpc"
 	"github.com/tsuna/gohbase/pb"
+	"github.com/tsuna/gohbase/test"
 	"github.com/tsuna/gohbase/test/mock"
 )
 
@@ -30,9 +35,9 @@ func TestErrors(t *testing.T) {
 }
 
 func TestWrite(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	c := &client{
 		conn: mockConn,
 	}
@@ -41,23 +46,15 @@ func TestWrite(t *testing.T) {
 	expectErr := errors.New("nope")
 	mockConn.EXPECT().Write(gomock.Any()).Return(0, expectErr).Times(1)
 	err := c.write([]byte("lol"))
-	if diff := test.Diff(expectErr, err); diff != "" {
+	if diff := atest.Diff(expectErr, err); diff != "" {
 		t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
 			expectErr, err, diff)
-	}
-
-	// check if it returns ErrShortWrite
-	mockConn.EXPECT().Write(gomock.Any()).Return(1, nil).Times(1)
-	err = c.write([]byte("lol"))
-	if diff := test.Diff(ErrShortWrite, err); diff != "" {
-		t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
-			ErrShortWrite, err, diff)
 	}
 
 	// check if it actually writes the right data
 	expected := []byte("lol")
 	mockConn.EXPECT().Write(gomock.Any()).Return(3, nil).Times(1).Do(func(buf []byte) {
-		if diff := test.Diff(expected, buf); diff != "" {
+		if diff := atest.Diff(expected, buf); diff != "" {
 			t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
 				expected, buf, diff)
 		}
@@ -69,9 +66,9 @@ func TestWrite(t *testing.T) {
 }
 
 func TestSendHello(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	c := &client{
 		conn:          mockConn,
 		effectiveUser: "root",
@@ -81,7 +78,7 @@ func TestSendHello(t *testing.T) {
 	mockConn.EXPECT().Write(gomock.Any()).Return(78, nil).Times(1).Do(func(buf []byte) {
 		expected := []byte("HBas\x00P\x00\x00\x00D\n\x06\n\x04root\x12\rClientService\x1a+" +
 			"org.apache.hadoop.hbase.codec.KeyValueCodec")
-		if diff := test.Diff(expected, buf); diff != "" {
+		if diff := atest.Diff(expected, buf); diff != "" {
 			t.Errorf("Type RegionClient:\n Expected: %#v\nReceived: %#v\nDiff:%s",
 				expected, buf, diff)
 		}
@@ -95,7 +92,7 @@ func TestSendHello(t *testing.T) {
 	mockConn.EXPECT().Write(gomock.Any()).Return(78, nil).Times(1).Do(func(buf []byte) {
 		expected := []byte("HBas\x00P\x00\x00\x00D\n\x06\n\x04root\x12\rMasterService\x1a+" +
 			"org.apache.hadoop.hbase.codec.KeyValueCodec")
-		if diff := test.Diff(expected, buf); diff != "" {
+		if diff := atest.Diff(expected, buf); diff != "" {
 			t.Errorf("Type MasterClient:\n Expected: %#v\nReceived: %#v\nDiff:%s",
 				expected, buf, diff)
 		}
@@ -107,9 +104,9 @@ func TestSendHello(t *testing.T) {
 }
 
 func TestFail(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	c := &client{
 		conn: mockConn,
 		done: make(chan struct{}),
@@ -142,11 +139,76 @@ func TestFail(t *testing.T) {
 			t.Error("expected done to be closed")
 		}
 	}
+}
 
-	if diff := test.Diff(expectedErr, c.err); diff != "" {
-		t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
-			expectedErr, c.err, diff)
+type mc struct {
+	*mock.MockConn
+
+	closed uint32
+}
+
+func (c *mc) Write(b []byte) (n int, err error) {
+	if v := atomic.LoadUint32(&c.closed); v != 0 {
+		return 0, errors.New("closed connection")
 	}
+	return 0, nil
+}
+
+func (c *mc) Close() error {
+	atomic.AddUint32(&c.closed, 1)
+	return nil
+}
+
+func TestQueueRPCMultiWithClose(t *testing.T) {
+	ctrl := test.NewController(t)
+	defer ctrl.Finish()
+
+	mockConn := mock.NewMockConn(ctrl)
+	mockConn.EXPECT().SetReadDeadline(gomock.Any()).AnyTimes()
+
+	ncalls := 1000
+
+	c := &client{
+		conn:          &mc{MockConn: mockConn},
+		rpcs:          make(chan hrpc.Call),
+		done:          make(chan struct{}),
+		sent:          make(map[uint32]hrpc.Call),
+		rpcQueueSize:  10,
+		flushInterval: 30 * time.Millisecond,
+	}
+
+	var wgProcessRPCs sync.WaitGroup
+	wgProcessRPCs.Add(1)
+	go func() {
+		c.processRPCs()
+		wgProcessRPCs.Done()
+	}()
+
+	calls := make([]hrpc.Call, ncalls)
+	for i := range calls {
+		call, err := hrpc.NewGet(context.Background(), []byte("yolo"), []byte("swag"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		call.SetRegion(reg0)
+		calls[i] = call
+	}
+
+	for _, call := range calls {
+		go c.QueueRPC(call)
+	}
+
+	c.Close()
+
+	// check that all calls are not stuck and get an error
+	for _, call := range calls {
+		r := <-call.ResultChan()
+		if r.Error == nil {
+			t.Error("got no error")
+		}
+	}
+
+	wgProcessRPCs.Wait()
 }
 
 type rpcMatcher struct {
@@ -169,58 +231,57 @@ func newRPCMatcher(payload []byte) gomock.Matcher {
 	return rpcMatcher{payload: payload}
 }
 
-func TestAwaitingRPCsFail(t *testing.T) {
-	ctrl := gomock.NewController(t)
+func TestProcessRPCsWithFail(t *testing.T) {
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
-	queueSize := 100
-	flushInterval := 1000 * time.Second
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
-	mockConn.EXPECT().Close().Times(1)
+	mockConn := mock.NewMockConn(ctrl)
+	mockConn.EXPECT().Close()
+
+	ncalls := 100
+
 	c := &client{
-		conn:          mockConn,
-		rpcs:          make(chan hrpc.Call),
-		done:          make(chan struct{}),
-		sent:          make(map[uint32]hrpc.Call),
-		rpcQueueSize:  queueSize,
-		flushInterval: flushInterval,
+		conn: mockConn,
+		rpcs: make(chan hrpc.Call),
+		done: make(chan struct{}),
+		sent: make(map[uint32]hrpc.Call),
+		// never send anything
+		rpcQueueSize:  ncalls + 1,
+		flushInterval: 1000 * time.Hour,
 	}
 
-	// define rpcs behaviour
-	var wgWrites sync.WaitGroup
-	// we send less calls then queueSize so that sendBatch isn't triggered
-	calls := make([]hrpc.Call, queueSize-1)
-	ctx := context.Background()
-	for i := range calls {
-		wgWrites.Add(1)
-		mockCall := mock.NewMockCall(ctrl)
-		mockCall.EXPECT().ResultChan().Return(make(chan hrpc.RPCResult, 1)).Times(1)
-		mockCall.EXPECT().Context().Return(ctx).Times(1)
-		calls[i] = mockCall
-	}
-
-	// process rpcs and close client in the middle of it to make sure that
-	// all queued up rpcs are processed eventually
-	var wg sync.WaitGroup
-	wg.Add(1)
+	var wgProcessRPCs sync.WaitGroup
+	wgProcessRPCs.Add(1)
 	go func() {
 		c.processRPCs()
-		wg.Done()
+		wgProcessRPCs.Done()
 	}()
 
-	// queue calls
+	calls := make([]hrpc.Call, ncalls)
+	for i := range calls {
+		call, err := hrpc.NewGet(context.Background(), []byte("yolo"), []byte("swag"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		call.SetRegion(reg0)
+		calls[i] = call
+	}
+
 	for _, call := range calls {
 		c.QueueRPC(call)
 	}
-	c.Close()
-	wg.Wait()
-	if len(c.rpcs) != 0 {
-		t.Errorf("Expected all buffered rpcs to be processed, %d left", len(c.rpcs))
+
+	c.fail(errors.New("OOOPS"))
+
+	// check that all calls are not stuck and get an error
+	for _, call := range calls {
+		r := <-call.ResultChan()
+		if r.Error != ErrClientDead {
+			t.Errorf("got unexpected error %v, expected %v", r.Error, ErrClientDead)
+		}
 	}
 
-	if len(c.sent) != 0 {
-		t.Errorf("Expected all awaiting rpcs to be processed, %d left", len(c.sent))
-	}
+	wgProcessRPCs.Wait()
 }
 
 func mockRPCProto(row string) (proto.Message, []byte) {
@@ -240,12 +301,13 @@ func mockRPCProto(row string) (proto.Message, []byte) {
 }
 
 func TestQueueRPC(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
 	queueSize := 30
 	flushInterval := 20 * time.Millisecond
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
+	mockConn.EXPECT().SetReadDeadline(gomock.Any()).AnyTimes()
 	c := &client{
 		conn:          mockConn,
 		rpcs:          make(chan hrpc.Call),
@@ -268,18 +330,16 @@ func TestQueueRPC(t *testing.T) {
 	for i := range calls {
 		wgWrites.Add(1)
 		mockCall := mock.NewMockCall(ctrl)
-		mockCall.EXPECT().Name().Return("lol").Times(1)
+		mockCall.EXPECT().Name().Return("Get").Times(1)
 		p, payload := mockRPCProto(fmt.Sprintf("rpc_%d", i))
-		mockCall.EXPECT().ToProto().Return(p, nil).Times(1)
-		mockCall.EXPECT().Context().Return(ctx).Times(2)
+		mockCall.EXPECT().ToProto().Return(p).Times(1)
+		mockCall.EXPECT().Context().Return(ctx).Times(1)
 		mockCall.EXPECT().ResultChan().Return(make(chan hrpc.RPCResult, 1)).Times(1)
 		calls[i] = mockCall
 
 		// we expect that it eventually writes to connection
 		mockConn.EXPECT().Write(newRPCMatcher(payload)).Times(1).Return(14+len(payload), nil).Do(
-			func(buf []byte) {
-				wgWrites.Done()
-			})
+			func(buf []byte) { wgWrites.Done() })
 	}
 
 	// queue calls in parallel
@@ -289,16 +349,12 @@ func TestQueueRPC(t *testing.T) {
 		}(call)
 	}
 
-	// wait till all calls complete
-	done := make(chan struct{})
-	go func() {
-		wgWrites.Wait()
-		close(done)
-	}()
-	select {
-	case <-time.After(2 * time.Second):
-		t.Fatalf("rpcs hasn't been written")
-	case <-done:
+	// wait till all writes complete
+	wgWrites.Wait()
+
+	// check sent map
+	if len(c.sent) != len(calls) {
+		t.Errorf("expected len(c.sent) be %d, got %d", len(calls), len(c.sent))
 	}
 
 	var wg sync.WaitGroup
@@ -320,7 +376,7 @@ func TestQueueRPC(t *testing.T) {
 				t.Errorf("Expected UnrecoverableError error")
 				return
 			}
-			if diff := test.Diff(ErrClientDead.error, err.error); diff != "" {
+			if diff := atest.Diff(ErrClientDead.error, err.error); diff != "" {
 				t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
 					ErrClientDead.error, err.error, diff)
 			}
@@ -331,12 +387,12 @@ func TestQueueRPC(t *testing.T) {
 }
 
 func TestUnrecoverableErrorWrite(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
 	queueSize := 1
 	flushInterval := 10 * time.Millisecond
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	c := &client{
 		conn:          mockConn,
 		rpcs:          make(chan hrpc.Call),
@@ -347,10 +403,10 @@ func TestUnrecoverableErrorWrite(t *testing.T) {
 	}
 	// define rpcs behaviour
 	mockCall := mock.NewMockCall(ctrl)
-	mockCall.EXPECT().Name().Return("lol").Times(1)
 	p, payload := mockRPCProto("rpc")
-	mockCall.EXPECT().ToProto().Return(p, nil).Times(1)
-	mockCall.EXPECT().Context().Return(context.Background()).Times(2)
+	mockCall.EXPECT().ToProto().Return(p).Times(1)
+	mockCall.EXPECT().Name().Return("Get").Times(1)
+	mockCall.EXPECT().Context().Return(context.Background()).Times(1)
 	result := make(chan hrpc.RPCResult, 1)
 	mockCall.EXPECT().ResultChan().Return(result).Times(1)
 	// we expect that it eventually writes to connection
@@ -358,16 +414,13 @@ func TestUnrecoverableErrorWrite(t *testing.T) {
 	mockConn.EXPECT().Write(newRPCMatcher(payload)).Times(1).Return(0, expErr)
 	mockConn.EXPECT().Close()
 
-	go c.QueueRPC(mockCall)
+	c.QueueRPC(mockCall)
+	// check that processRPCs exists
 	c.processRPCs()
 	r := <-result
-	err, ok := r.Error.(UnrecoverableError)
-	if !ok {
-		t.Errorf("Expected UnrecoverableError error")
-	}
-	if diff := test.Diff(expErr, err.error); diff != "" {
+	if diff := atest.Diff(ErrClientDead.Error(), r.Error.Error()); diff != "" {
 		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-			expErr, err.error, diff)
+			expErr, r.Error, diff)
 	}
 	if len(c.sent) != 0 {
 		t.Errorf("Expected all awaiting rpcs to be processed, %d left", len(c.sent))
@@ -375,12 +428,12 @@ func TestUnrecoverableErrorWrite(t *testing.T) {
 }
 
 func TestUnrecoverableErrorRead(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
 	queueSize := 1
 	flushInterval := 10 * time.Millisecond
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	c := &client{
 		conn:          mockConn,
 		rpcs:          make(chan hrpc.Call),
@@ -410,24 +463,171 @@ func TestUnrecoverableErrorRead(t *testing.T) {
 		t.Errorf("Expected all awaiting rpcs to be processed, %d left", len(c.sent))
 	}
 	r := <-result
-	err, ok := r.Error.(UnrecoverableError)
-	if !ok {
-		t.Errorf("Expected UnrecoverableError error")
-	}
-	expErr := errors.New("failed to read: read failure")
-	if diff := test.Diff(expErr, err.error); diff != "" {
+	if diff := atest.Diff(ErrClientDead.Error(), r.Error.Error()); diff != "" {
 		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-			expErr, err.error, diff)
+			ErrClientDead, r.Error, diff)
+	}
+}
+
+func TestUnrecoverableExceptionResponse(t *testing.T) {
+	ctrl := test.NewController(t)
+	defer ctrl.Finish()
+	mockConn := mock.NewMockConn(ctrl)
+	mockConn.EXPECT().SetReadDeadline(gomock.Any()).Times(2)
+	c := &client{
+		conn:          mockConn,
+		rpcs:          make(chan hrpc.Call),
+		done:          make(chan struct{}),
+		sent:          make(map[uint32]hrpc.Call),
+		rpcQueueSize:  1,
+		flushInterval: 1000 * time.Second,
+	}
+
+	rpc, err := hrpc.NewGetStr(context.Background(), "test1", "yolo")
+	if err != nil {
+		t.Fatalf("Failed to create Get request: %s", err)
+	}
+
+	c.registerRPC(rpc)
+	c.inFlightUp()
+
+	var response []byte
+	b := proto.NewBuffer(response)
+
+	err = b.EncodeMessage(&pb.ResponseHeader{
+		CallId: proto.Uint32(1),
+		Exception: &pb.ExceptionResponse{
+			ExceptionClassName: proto.String(
+				"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException"),
+			StackTrace: proto.String("ooops"),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	response = b.Bytes()
+
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: 4}).Times(1).Return(4, nil).
+		Do(func(buf []byte) { binary.BigEndian.PutUint32(buf, uint32(len(response))) })
+
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: len(response)}).Times(1).
+		Return(len(response), nil).Do(func(buf []byte) { copy(buf, response) })
+
+	expErr := exceptionToError(
+		"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException", "ooops")
+
+	err = c.receive()
+	if _, ok := err.(UnrecoverableError); !ok {
+		if err.Error() != expErr.Error() {
+			t.Fatalf("expected UnrecoverableError with message %q, got %T: %v", expErr, err, err)
+		}
+	}
+
+	re := <-rpc.ResultChan()
+	if re.Error != err {
+		t.Errorf("expected error %v, got %v", err, re.Error)
+	}
+}
+
+func TestReceiveDecodeProtobufError(t *testing.T) {
+	ctrl := test.NewController(t)
+	defer ctrl.Finish()
+
+	mockConn := mock.NewMockConn(ctrl)
+	c := &client{
+		conn: mockConn,
+		done: make(chan struct{}),
+		sent: make(map[uint32]hrpc.Call),
+	}
+
+	mockCall := mock.NewMockCall(ctrl)
+	result := make(chan hrpc.RPCResult, 1)
+	mockCall.EXPECT().ResultChan().Return(result).Times(1)
+	mockCall.EXPECT().NewResponse().Return(&pb.MutateResponse{}).Times(1)
+	mockCall.EXPECT().Context().Return(context.Background()).Times(1)
+
+	c.sent[1] = mockCall
+	c.inFlight = 1
+
+	// Append mutate response with a chunk in the middle missing
+	response := []byte{6, 8, 1, 26, 2, 8, 38, 34, 0, 0, 0, 22,
+		0, 0, 0, 4, 0, 4, 121, 111, 108, 111, 2, 99, 102, 115, 119, 97, 103, 0, 0, 0, 0, 0, 0,
+		0, 0, 4, 109, 101, 111, 119}
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: 4}).Times(1).Return(4, nil).
+		Do(func(buf []byte) { binary.BigEndian.PutUint32(buf, uint32(len(response))) })
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: len(response)}).Times(1).
+		Return(len(response), nil).Do(func(buf []byte) { copy(buf, response) })
+	mockConn.EXPECT().SetReadDeadline(time.Time{}).Times(1)
+	expError := errors.New(
+		"failed to decode the response: proto: pb.MutateResponse: illegal tag 0 (wire type 0)")
+
+	err := c.receive()
+	if err == nil || err.Error() != expError.Error() {
+		t.Errorf("Expected error %v, got %v", expError, err)
+	}
+
+	res := <-result
+	if err != res.Error {
+		t.Errorf("Expected error %v, got %v", err, res.Error)
+	}
+}
+
+type callWithCellBlocksError struct{ hrpc.Call }
+
+func (cwcbe callWithCellBlocksError) DeserializeCellBlocks(proto.Message, []byte) (uint32, error) {
+	return 0, errors.New("OOPS")
+}
+
+func TestReceiveDeserializeCellblocksError(t *testing.T) {
+	ctrl := test.NewController(t)
+	defer ctrl.Finish()
+
+	mockConn := mock.NewMockConn(ctrl)
+	c := &client{
+		conn: mockConn,
+		done: make(chan struct{}),
+		sent: make(map[uint32]hrpc.Call),
+	}
+
+	mockCall := mock.NewMockCall(ctrl)
+	result := make(chan hrpc.RPCResult, 1)
+	mockCall.EXPECT().ResultChan().Return(result).Times(1)
+	mockCall.EXPECT().NewResponse().Return(&pb.MutateResponse{}).Times(1)
+	mockCall.EXPECT().Context().Return(context.Background()).Times(1)
+
+	c.sent[1] = callWithCellBlocksError{mockCall}
+	c.inFlight = 1
+
+	// Append mutate response
+	response := []byte{6, 8, 1, 26, 2, 8, 38, 6, 10, 4, 16, 1, 32, 0, 0, 0, 0, 34, 0, 0, 0, 22,
+		0, 0, 0, 4, 0, 4, 121, 111, 108, 111, 2, 99, 102, 115, 119, 97, 103, 0, 0, 0, 0, 0, 0,
+		0, 0, 4, 109, 101, 111, 119}
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: 4}).Times(1).Return(4, nil).
+		Do(func(buf []byte) { binary.BigEndian.PutUint32(buf, uint32(len(response))) })
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: len(response)}).Times(1).
+		Return(len(response), nil).Do(func(buf []byte) { copy(buf, response) })
+	mockConn.EXPECT().SetReadDeadline(time.Time{}).Times(1)
+	expError := errors.New("failed to decode the response: OOPS")
+
+	err := c.receive()
+	if err == nil || err.Error() != expError.Error() {
+		t.Errorf("Expected error %v, got %v", expError, err)
+	}
+
+	res := <-result
+	if err != res.Error {
+		t.Errorf("Expected error %v, got %v", err, res.Error)
 	}
 }
 
 func TestUnexpectedSendError(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
 	queueSize := 1
 	flushInterval := 10 * time.Millisecond
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	c := &client{
 		conn:          mockConn,
 		rpcs:          make(chan hrpc.Call),
@@ -439,16 +639,16 @@ func TestUnexpectedSendError(t *testing.T) {
 	go c.processRPCs()
 	// define rpcs behaviour
 	mockCall := mock.NewMockCall(ctrl)
-	err := errors.New("ToProto error")
-	mockCall.EXPECT().ToProto().Return(nil, err).Times(1)
-	mockCall.EXPECT().Context().Return(context.Background()).Times(2)
+	mockCall.EXPECT().ToProto().Return(nil).Times(1)
+	mockCall.EXPECT().Context().Return(context.Background()).Times(1)
 	result := make(chan hrpc.RPCResult, 1)
 	mockCall.EXPECT().ResultChan().Return(result).Times(1)
+	mockCall.EXPECT().Name().Return("Whatever").Times(1)
 
 	c.QueueRPC(mockCall)
 	r := <-result
-	err = fmt.Errorf("failed to convert RPC: %v", err)
-	if diff := test.Diff(err, r.Error); diff != "" {
+	err := errors.New("failed to marshal request: proto: Marshal called with nil")
+	if diff := atest.Diff(err, r.Error); diff != "" {
 		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
 			err, r.Error, diff)
 	}
@@ -460,116 +660,81 @@ func TestUnexpectedSendError(t *testing.T) {
 	c.Close()
 }
 
-func TestSendBatch(t *testing.T) {
-	ctrl := gomock.NewController(t)
+func TestProcessRPCs(t *testing.T) {
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
-	queueSize := 1
-	flushInterval := 10 * time.Millisecond
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
-	c := &client{
-		conn:          mockConn,
-		rpcs:          make(chan hrpc.Call),
-		done:          make(chan struct{}),
-		sent:          make(map[uint32]hrpc.Call),
-		rpcQueueSize:  queueSize,
-		flushInterval: flushInterval,
-	}
-	mockConn.EXPECT().Close()
 
-	batch := make([]*call, 9)
-	ctx := context.Background()
-	canceledCtx, cancel := context.WithCancel(ctx)
-	cancel()
-	for i := range batch {
-		mockCall := mock.NewMockCall(ctrl)
-		if i < 3 {
-			// we expect that these rpc are going to be ignored
-			mockCall.EXPECT().Context().Return(canceledCtx).Times(1)
-		} else if i < 6 {
-			// we expect rpcs 3-5 to be written
-			mockCall.EXPECT().Name().Return("lol").Times(1)
-			p, payload := mockRPCProto(fmt.Sprintf("rpc_%d", i))
-			mockCall.EXPECT().ToProto().Return(p, nil).Times(1)
-			mockCall.EXPECT().Context().Return(ctx).Times(1)
-			// we expect that it eventually writes to connection
-			i := i
-			mockConn.EXPECT().Write(newRPCMatcher(payload)).Times(1).Return(
-				14+len(payload), nil).Do(func(buf []byte) {
-				if i == 5 {
-					// we close on 6th rpc to check if sendBatch stop appropriately
-					c.Close()
-				}
+	tests := []struct {
+		qsize    int
+		interval time.Duration
+		ncalls   int
+		nsent    int
+	}{
+		{qsize: 100000, interval: 30 * time.Millisecond, ncalls: 100, nsent: 1},
+		{qsize: 2, interval: 1000 * time.Hour, ncalls: 100, nsent: 50},
+	}
+
+	for i, tcase := range tests {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			mockConn := mock.NewMockConn(ctrl)
+			mockConn.EXPECT().Close()
+
+			c := &client{
+				conn:          mockConn,
+				rpcs:          make(chan hrpc.Call),
+				done:          make(chan struct{}),
+				sent:          make(map[uint32]hrpc.Call),
+				rpcQueueSize:  tcase.qsize,
+				flushInterval: tcase.interval,
+			}
+
+			var wgProcessRPCs sync.WaitGroup
+			wgProcessRPCs.Add(1)
+			go func() {
+				c.processRPCs()
+				wgProcessRPCs.Done()
+			}()
+
+			var wgWrite sync.WaitGroup
+			wgWrite.Add(tcase.nsent)
+			mockConn.EXPECT().Write(gomock.Any()).
+				Times(tcase.nsent).Return(42, nil).Do(func(buf []byte) {
+				wgWrite.Done() // test will timeout if some rpcs are never processed
 			})
-		} else if i == 6 {
-			// last loop before return
-			mockCall.EXPECT().Context().Return(ctx).Times(1)
-		}
-		// we expect the rest to be not even processed
-		batch[i] = &call{id: uint32(i), Call: mockCall}
-	}
-	rpcs := c.sendBatch(batch)
-	// try sending batch again to make sure we reset the slice
-	c.sendBatch(rpcs)
-}
+			mockConn.EXPECT().SetReadDeadline(gomock.Any()).Times(tcase.nsent)
 
-func TestFlushInterval(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	queueSize := 100000
-	flushInterval := 30 * time.Millisecond
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
-	c := &client{
-		conn:          mockConn,
-		rpcs:          make(chan hrpc.Call),
-		done:          make(chan struct{}),
-		sent:          make(map[uint32]hrpc.Call),
-		rpcQueueSize:  queueSize,
-		flushInterval: flushInterval,
-	}
-	mockConn.EXPECT().Close()
+			calls := make([]hrpc.Call, tcase.ncalls)
+			for i := range calls {
+				call, err := hrpc.NewGet(context.Background(), []byte("yolo"), []byte("swag"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				call.SetRegion(reg0)
+				calls[i] = call
+			}
 
-	var wgProcessRPCs sync.WaitGroup
-	wgProcessRPCs.Add(1)
-	go func() {
-		c.processRPCs()
-		wgProcessRPCs.Done()
-	}()
+			for _, call := range calls {
+				c.QueueRPC(call)
+			}
 
-	ctx := context.Background()
-	var wgWrites sync.WaitGroup
-	numCalls := 100
-	calls := make([]hrpc.Call, numCalls)
-	for i := range calls {
-		wgWrites.Add(1)
-		mockCall := mock.NewMockCall(ctrl)
-		mockCall.EXPECT().Name().Return("lol").Times(1)
-		p, payload := mockRPCProto(fmt.Sprintf("rpc_%d", i))
-		mockCall.EXPECT().ToProto().Return(p, nil).Times(1)
-		mockCall.EXPECT().Context().Return(ctx).Times(2)
-		mockCall.EXPECT().ResultChan().Return(make(chan hrpc.RPCResult, 1)).Times(1)
-		mockConn.EXPECT().Write(newRPCMatcher(payload)).Times(1).Return(
-			14+len(payload), nil).Do(func(buf []byte) {
-			wgWrites.Done()
+			wgWrite.Wait()
+
+			c.Close()
+			wgProcessRPCs.Wait()
+
+			if int(c.inFlight) != tcase.nsent {
+				t.Errorf("expected %d in-flight rpcs, got %d", tcase.nsent, c.inFlight)
+			}
 		})
-		calls[i] = mockCall
 	}
-	for _, mockCall := range calls {
-		c.QueueRPC(mockCall)
-	}
-
-	// test will timeout if some rpcs are never processed
-	wgWrites.Wait()
-	// clean up
-	c.Close()
-	wgProcessRPCs.Wait()
 }
 
 func TestRPCContext(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 	queueSize := 10
 	flushInterval := 1000 * time.Second
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	mockConn.EXPECT().Close()
 	c := &client{
 		conn:          mockConn,
@@ -580,33 +745,18 @@ func TestRPCContext(t *testing.T) {
 		flushInterval: flushInterval,
 	}
 
-	var wgProcessRPCs sync.WaitGroup
-	wgProcessRPCs.Add(1)
-	go func() {
-		c.processRPCs()
-		wgProcessRPCs.Done()
-	}()
+	mockConn.EXPECT().SetReadDeadline(gomock.Any()).Times(1)
 
-	var wgWrites, wgThrottle sync.WaitGroup
-	wgThrottle.Add(1)
-	ctx := context.Background()
-	for i := 0; i < queueSize; i++ {
-		wgWrites.Add(1)
-		mockCall := mock.NewMockCall(ctrl)
-		mockCall.EXPECT().Name().Return("lol").Times(1)
-		p, payload := mockRPCProto(fmt.Sprintf("rpc_%d", i))
-		// throttle write, until we push rpc with canceled contxt
-		mockCall.EXPECT().ToProto().Return(p, nil).Times(1).Do(func() {
-			wgThrottle.Wait()
-		})
-		mockCall.EXPECT().Context().Return(ctx).Times(2)
-		mockCall.EXPECT().ResultChan().Return(make(chan hrpc.RPCResult, 1)).Times(1)
-		mockConn.EXPECT().Write(newRPCMatcher(payload)).Times(1).Return(
-			14+len(payload), nil).Do(func(buf []byte) {
-			wgWrites.Done()
-		})
-		c.QueueRPC(mockCall)
-	}
+	// queue rpc with background context
+	mockCall := mock.NewMockCall(ctrl)
+	mockCall.EXPECT().Name().Return("Get").Times(1)
+	p, payload := mockRPCProto("yolo")
+	mockCall.EXPECT().ToProto().Return(p).Times(1)
+	mockCall.EXPECT().Context().Return(context.Background()).Times(1)
+	mockCall.EXPECT().ResultChan().Return(make(chan hrpc.RPCResult, 1)).Times(1)
+	mockConn.EXPECT().Write(newRPCMatcher(payload)).Times(1).Return(14+len(payload), nil)
+	c.QueueRPC(mockCall)
+
 	ctxCancel, cancel := context.WithCancel(context.Background())
 	cancel()
 	callWithCancel := mock.NewMockCall(ctrl)
@@ -614,21 +764,124 @@ func TestRPCContext(t *testing.T) {
 	// this shouldn't block
 	c.QueueRPC(callWithCancel)
 
-	wgThrottle.Done()
-
-	// test will timeout if some rpcs are never processed
-	wgWrites.Wait()
+	if int(c.inFlight) != 1 {
+		t.Errorf("expected %d in-flight rpcs, got %d", 1, c.inFlight)
+	}
 	// clean up
 	c.Close()
-	wgProcessRPCs.Wait()
+}
+
+type readBufSizeMatcher struct {
+	l int
+}
+
+func (r readBufSizeMatcher) Matches(x interface{}) bool {
+	data, ok := x.([]byte)
+	if !ok {
+		return false
+	}
+	return len(data) == r.l
+}
+
+func (r readBufSizeMatcher) String() string {
+	return fmt.Sprintf("buf size is equal to %q", r.l)
+}
+
+func TestSanity(t *testing.T) {
+	ctrl := test.NewController(t)
+	defer ctrl.Finish()
+	mockConn := mock.NewMockConn(ctrl)
+	c := &client{
+		conn:          mockConn,
+		rpcs:          make(chan hrpc.Call),
+		done:          make(chan struct{}),
+		sent:          make(map[uint32]hrpc.Call),
+		rpcQueueSize:  1, // size one to skip sendBatch
+		flushInterval: 1000 * time.Second,
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		c.processRPCs()
+		wg.Done()
+	}()
+
+	// using Append as it returns cellblocks
+	app, err := hrpc.NewAppStr(context.Background(), "test1", "yolo",
+		map[string]map[string][]byte{"cf": map[string][]byte{"swag": []byte("meow")}})
+	if err != nil {
+		t.Fatalf("Failed to create Get request: %s", err)
+	}
+	app.SetRegion(
+		NewInfo(0, nil, []byte("test1"), []byte("test1,,lololololololololololo"), nil, nil))
+
+	mockConn.EXPECT().Write(gomock.Any()).Times(1).Return(0, nil)
+	mockConn.EXPECT().SetReadDeadline(gomock.Any()).Times(1)
+
+	c.QueueRPC(app)
+
+	response := []byte{6, 8, 1, 26, 2, 8, 38, 6, 10, 4, 16, 1, 32, 0, 0, 0, 0, 34, 0, 0, 0, 22,
+		0, 0, 0, 4, 0, 4, 121, 111, 108, 111, 2, 99, 102, 115, 119, 97, 103, 0, 0, 0, 0, 0, 0,
+		0, 0, 4, 109, 101, 111, 119}
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: 4}).Times(1).Return(4, nil).
+		Do(func(buf []byte) {
+			binary.BigEndian.PutUint32(buf, uint32(len(response)))
+		})
+	mockConn.EXPECT().Read(readBufSizeMatcher{l: len(response)}).Times(1).
+		Return(len(response), nil).Do(func(buf []byte) {
+		copy(buf, response)
+
+		// stall the next read
+		mockConn.EXPECT().Read(readBufSizeMatcher{l: 4}).MaxTimes(1).
+			Return(0, errors.New("closed")).Do(func(buf []byte) { <-c.done })
+	})
+	mockConn.EXPECT().SetReadDeadline(time.Time{}).Times(1)
+	wg.Add(1)
+	go func() {
+		c.receiveRPCs()
+		wg.Done()
+	}()
+
+	re := <-app.ResultChan()
+	if re.Error != nil {
+		t.Error(re.Error)
+	}
+	r, ok := re.Msg.(*pb.MutateResponse)
+	if !ok {
+		t.Fatalf("got unexpected type %T for response", r)
+	}
+	expResult := &pb.Result{
+		AssociatedCellCount: proto.Int32(1),
+		Stale:               proto.Bool(false),
+		Cell: []*pb.Cell{
+			&pb.Cell{
+				Row:       []byte("yolo"),
+				Family:    []byte("cf"),
+				Qualifier: []byte("swag"),
+				Value:     []byte("meow"),
+				CellType:  pb.CellType_PUT.Enum(),
+				Timestamp: proto.Uint64(0),
+			},
+		},
+	}
+	if d := atest.Diff(expResult, r.Result); len(d) != 0 {
+		t.Error(d)
+	}
+	if int(c.inFlight) != 0 {
+		t.Errorf("expected %d in-flight rpcs, got %d", 0, c.inFlight)
+	}
+
+	mockConn.EXPECT().Close().Times(1)
+	c.Close()
+	wg.Wait()
 }
 
 func BenchmarkSendBatchMemory(b *testing.B) {
-	b.Skip("need to comment out short write detection")
-
-	ctrl := gomock.NewController(b)
+	ctrl := test.NewController(b)
 	defer ctrl.Finish()
-	mockConn := mock.NewMockReadWriteCloser(ctrl)
+	mockConn := mock.NewMockConn(ctrl)
 	c := &client{
 		conn: mockConn,
 		rpcs: make(chan hrpc.Call),
@@ -643,12 +896,10 @@ func BenchmarkSendBatchMemory(b *testing.B) {
 	var wgWrites sync.WaitGroup
 	ctx := context.Background()
 	mockCall := mock.NewMockCall(ctrl)
-	mockCall.EXPECT().Name().Return("lol").AnyTimes()
+	mockCall.EXPECT().Name().Return("Get").AnyTimes()
 	p, _ := mockRPCProto("rpc")
-	mockCall.EXPECT().ToProto().Return(p, nil).AnyTimes()
+	mockCall.EXPECT().ToProto().Return(p).AnyTimes()
 	mockCall.EXPECT().Context().Return(ctx).AnyTimes()
-	// for this benchmark to work, need to comment out section of in c.write()
-	// that detect short writes
 	mockConn.EXPECT().Write(gomock.Any()).AnyTimes().Return(0, nil).Do(func(buf []byte) {
 		wgWrites.Done()
 	})
@@ -663,6 +914,38 @@ func BenchmarkSendBatchMemory(b *testing.B) {
 		wgWrites.Wait()
 	}
 	// we don't care about cleaning up
+}
+
+func BenchmarkSetReadDeadline(b *testing.B) {
+	l, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			b.Error(err)
+		}
+		wg.Done()
+		conn.Close()
+	}()
+
+	conn, err := net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		conn.SetReadDeadline(time.Now().Add(DefaultReadTimeout))
+	}
+	b.StopTimer()
+
+	conn.Close()
+	l.Close()
+	wg.Wait()
 }
 
 func TestBuffer(t *testing.T) {

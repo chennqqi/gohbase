@@ -14,17 +14,18 @@ import (
 
 // DeleteTable represents a DeleteTable HBase call
 type DeleteTable struct {
-	tableOp
+	base
 }
 
 // NewDeleteTable creates a new DeleteTable request that will delete the
 // given table in HBase. For use by the admin client.
 func NewDeleteTable(ctx context.Context, table []byte) *DeleteTable {
 	return &DeleteTable{
-		tableOp{base{
-			table: table,
-			ctx:   ctx,
-		}},
+		base{
+			table:    table,
+			ctx:      ctx,
+			resultch: make(chan RPCResult, 1),
+		},
 	}
 }
 
@@ -34,14 +35,14 @@ func (dt *DeleteTable) Name() string {
 }
 
 // ToProto converts the RPC into a protobuf message
-func (dt *DeleteTable) ToProto() (proto.Message, error) {
+func (dt *DeleteTable) ToProto() proto.Message {
 	return &pb.DeleteTableRequest{
 		TableName: &pb.TableName{
 			// TODO: hadle namespaces properly
 			Namespace: []byte("default"),
 			Qualifier: dt.table,
 		},
-	}, nil
+	}
 }
 
 // NewResponse creates an empty protobuf message to read the response of this

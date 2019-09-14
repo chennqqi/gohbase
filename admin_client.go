@@ -7,6 +7,7 @@ package gohbase
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	log "github.com/Sirupsen/logrus"
@@ -22,6 +23,7 @@ type AdminClient interface {
 	DeleteTable(t *hrpc.DeleteTable) error
 	EnableTable(t *hrpc.EnableTable) error
 	DisableTable(t *hrpc.DisableTable) error
+	ClusterStatus() (*pb.ClusterStatus, error)
 }
 
 // NewAdminClient creates an admin HBase client.
@@ -38,15 +40,33 @@ func newAdminClient(zkquorum string, options ...Option) AdminClient {
 		rpcQueueSize:  defaultRPCQueueSize,
 		flushInterval: defaultFlushInterval,
 		// empty region in order to be able to set client to it
-		adminRegionInfo: region.NewInfo(0, nil, nil, nil, nil, nil),
-		zkClient:        zk.NewClient(zkquorum),
-		zkRoot:          defaultZkRoot,
-		effectiveUser:   defaultEffectiveUser,
+		adminRegionInfo:     region.NewInfo(0, nil, nil, nil, nil, nil),
+		zkTimeout:           defaultZkTimeout,
+		zkRoot:              defaultZkRoot,
+		effectiveUser:       defaultEffectiveUser,
+		regionLookupTimeout: region.DefaultLookupTimeout,
+		regionReadTimeout:   region.DefaultReadTimeout,
 	}
 	for _, option := range options {
 		option(c)
 	}
+	c.zkClient = zk.NewClient(zkquorum, c.zkTimeout)
 	return c
+}
+
+//Get the status of the cluster
+func (c *client) ClusterStatus() (*pb.ClusterStatus, error) {
+	pbmsg, err := c.SendRPC(hrpc.NewClusterStatus())
+	if err != nil {
+		return nil, err
+	}
+
+	r, ok := pbmsg.(*pb.GetClusterStatusResponse)
+	if !ok {
+		return nil, fmt.Errorf("sendRPC returned not a ClusterStatusResponse")
+	}
+
+	return r.GetClusterStatus(), nil
 }
 
 func (c *client) CreateTable(t *hrpc.CreateTable) error {
@@ -113,15 +133,18 @@ func (c *client) checkProcedureWithBackoff(ctx context.Context, procID uint64) e
 			return err
 		}
 
-		statusRes, ok := pbmsg.(*pb.GetProcedureResultResponse)
-		if !ok {
-			return fmt.Errorf("sendRPC returned not a GetProcedureResultResponse")
-		}
-
-		switch statusRes.GetState() {
+		res := pbmsg.(*pb.GetProcedureResultResponse)
+		switch res.GetState() {
 		case pb.GetProcedureResultResponse_NOT_FOUND:
 			return fmt.Errorf("procedure not found")
 		case pb.GetProcedureResultResponse_FINISHED:
+			if fe := res.Exception; fe != nil {
+				ge := fe.GenericException
+				if ge == nil {
+					return errors.New("got unexpected empty exception")
+				}
+				return fmt.Errorf("procedure exception: %s: %s", ge.GetClassName(), ge.GetMessage())
+			}
 			return nil
 		default:
 			backoff, err = sleepAndIncreaseBackoff(ctx, backoff)
