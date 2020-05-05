@@ -9,7 +9,7 @@ import (
 	"context"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/pb"
+	"github.com/chennqqi/gohbase/pb"
 )
 
 // Get represents a Get HBase call.

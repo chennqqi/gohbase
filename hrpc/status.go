@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/pb"
+	"github.com/chennqqi/gohbase/pb"
 )
 
 // ClusterStatus to represent a cluster status request

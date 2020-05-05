@@ -18,8 +18,8 @@ import (
 
 	"github.com/aristanetworks/goarista/test"
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/filter"
-	"github.com/tsuna/gohbase/pb"
+	"github.com/chennqqi/gohbase/filter"
+	"github.com/chennqqi/gohbase/pb"
 )
 
 func TestNewGet(t *testing.T) {

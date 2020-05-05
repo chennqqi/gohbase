@@ -5,8 +5,8 @@ package mock
 
 import (
 	gomock "github.com/golang/mock/gomock"
-	hrpc "github.com/tsuna/gohbase/hrpc"
-	pb "github.com/tsuna/gohbase/pb"
+	hrpc "github.com/chennqqi/gohbase/hrpc"
+	pb "github.com/chennqqi/gohbase/pb"
 	reflect "reflect"
 )
 

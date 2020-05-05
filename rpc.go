@@ -15,9 +15,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/golang/protobuf/proto"
-	"github.com/tsuna/gohbase/hrpc"
-	"github.com/tsuna/gohbase/region"
-	"github.com/tsuna/gohbase/zk"
+	"github.com/chennqqi/gohbase/hrpc"
+	"github.com/chennqqi/gohbase/region"
+	"github.com/chennqqi/gohbase/zk"
 )
 
 // Constants
